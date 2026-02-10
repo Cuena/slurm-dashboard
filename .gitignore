@@ -1,0 +1,5 @@
+.cache
+.gocache
+scripts/
+
+slurm_test.go
