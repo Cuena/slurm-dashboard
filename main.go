@@ -1496,6 +1496,7 @@ func (m Model) responsiveTableColumns(contentWidth int) []table.Column {
 	if usable < 1 {
 		usable = 1
 	}
+	colFrame := tableColumnFrameWidth()
 
 	idW := 8
 	statusW := 6
@@ -1512,16 +1513,20 @@ func (m Model) responsiveTableColumns(contentWidth int) []table.Column {
 		{"Nodelist", 15},
 	}
 
-	sumOther := idW + statusW
+	widthCost := func(raw int) int {
+		return raw + colFrame
+	}
+
+	sumOther := widthCost(idW) + widthCost(statusW)
 	var chosen []optCol
 	for _, c := range optionals {
-		if usable-(sumOther+c.width) >= nameMin {
+		if usable-(sumOther+widthCost(c.width)) >= widthCost(nameMin) {
 			chosen = append(chosen, c)
-			sumOther += c.width
+			sumOther += widthCost(c.width)
 		}
 	}
 
-	nameW := usable - sumOther
+	nameW := usable - sumOther - colFrame
 	if nameW < nameMin {
 		nameW = nameMin
 	}
@@ -1534,6 +1539,17 @@ func (m Model) responsiveTableColumns(contentWidth int) []table.Column {
 		cols = append(cols, table.Column{Title: c.title, Width: c.width})
 	}
 	return cols
+}
+
+func tableColumnFrameWidth() int {
+	// Both header and body cells add horizontal frame (padding/border/margins).
+	// Account for the larger one so computed columns don't wrap onto a second line.
+	headerFrame := tableHeaderStyle.GetHorizontalFrameSize()
+	cellFrame := table.DefaultStyles().Cell.GetHorizontalFrameSize()
+	if cellFrame > headerFrame {
+		return cellFrame
+	}
+	return headerFrame
 }
 
 func joinWithGap(parts []string, gap int) string {

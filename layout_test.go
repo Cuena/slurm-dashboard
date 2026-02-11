@@ -82,3 +82,24 @@ func measureView(view string) (width int, height int) {
 	}
 	return
 }
+
+func TestResponsiveTableColumnsFitHeaderWidth(t *testing.T) {
+	model := NewModel()
+	frame := tableColumnFrameWidth()
+	testWidths := []int{50, 60, 70, 80, 100}
+
+	for _, contentWidth := range testWidths {
+		cols := model.responsiveTableColumns(contentWidth)
+		headerWidth := 0
+		for _, col := range cols {
+			if col.Width <= 0 {
+				continue
+			}
+			headerWidth += col.Width + frame
+		}
+
+		if headerWidth > contentWidth {
+			t.Fatalf("header width %d exceeds content width %d (columns=%v)", headerWidth, contentWidth, cols)
+		}
+	}
+}
