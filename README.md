@@ -94,42 +94,62 @@ Copy uses OSC52, so clipboard support depends on your terminal/tmux setup.
 
 ## Environment Variables
 
-- `SLURM_DASHBOARD_THEME=auto|dark|light`
-- `SLURM_DASHBOARD_SURFACES=transparent|solid`
-- `SLURM_DASHBOARD_PALETTE=dracula-soft|classic`
-- `SLURM_DASHBOARD_HISTORY_DAYS=<positive-integer>` (default: `3`)
+- `SLURM_DASHBOARD_THEME=auto|dark|light`: UI theme selection.
+- `SLURM_DASHBOARD_SURFACES=transparent|solid`: background style (terminal-dependent).
+- `SLURM_DASHBOARD_PALETTE=dracula-soft|classic`: color palette.
+- `SLURM_DASHBOARD_HISTORY_DAYS=<positive-integer>` (default: `3`): history window for `sacct` mode.
 - `SLURM_DASHBOARD_LOG_ARCHIVE_DIR=/path/to/log/archive`
+  - Used for the "archive convention" fallback when Slurm metadata is missing for old jobs.
+  - Default (if unset): `~/.slurm-dashboard/logs` (often private to you).
+  - Optional: point this to a shared project directory (and ensure permissions) if you want to share logs.
 
 ## Log Recovery For Old Jobs
 
 When Slurm metadata is no longer available for old jobs, the dashboard checks this archive convention:
 
-- `~/.slurm-dashboard/logs/<jobid>.out`
-- `~/.slurm-dashboard/logs/<jobid>.err`
+- `$SLURM_DASHBOARD_LOG_ARCHIVE_DIR/<jobid>.out` (default: `~/.slurm-dashboard/logs/<jobid>.out`)
+- `$SLURM_DASHBOARD_LOG_ARCHIVE_DIR/<jobid>.err` (default: `~/.slurm-dashboard/logs/<jobid>.err`)
 
 Compatibility names are also checked:
 
-- `~/.slurm-dashboard/logs/slurm-<jobid>.out`
-- `~/.slurm-dashboard/logs/slurm-<jobid>.err`
+- `$SLURM_DASHBOARD_LOG_ARCHIVE_DIR/slurm-<jobid>.out`
+- `$SLURM_DASHBOARD_LOG_ARCHIVE_DIR/slurm-<jobid>.err`
 
 Recommended `sbatch` directives:
 
 ```bash
+# Private (default slurm-dashboard location):
 #SBATCH --output=$HOME/.slurm-dashboard/logs/%j.out
 #SBATCH --error=$HOME/.slurm-dashboard/logs/%j.err
+#
+# Shared (optional):
+#SBATCH --output=/absolute/shared/path/slurm-dashboard/logs/%j.out
+#SBATCH --error=/absolute/shared/path/slurm-dashboard/logs/%j.err
 ```
 
 One-time setup:
 
 ```bash
+# Private (default):
 mkdir -p "$HOME/.slurm-dashboard/logs"
+
+# Shared (optional):
+export SLURM_DASHBOARD_LOG_ARCHIVE_DIR="/absolute/shared/path/slurm-dashboard/logs"
+mkdir -p "$SLURM_DASHBOARD_LOG_ARCHIVE_DIR"
 ```
 
 For array jobs:
 
 ```bash
+# Private:
 sbatch \
   --output="$HOME/.slurm-dashboard/logs/%A_%a.out" \
   --error="$HOME/.slurm-dashboard/logs/%A_%a.err" \
+  your_array_job.sbatch
+
+# Shared (after exporting SLURM_DASHBOARD_LOG_ARCHIVE_DIR):
+sbatch \
+  --output="$SLURM_DASHBOARD_LOG_ARCHIVE_DIR/%A_%a.out" \
+  --error="$SLURM_DASHBOARD_LOG_ARCHIVE_DIR/%A_%a.err" \
   your_array_job.sbatch
 ```

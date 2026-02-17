@@ -485,6 +485,11 @@ func resolveLogPath(value, baseDir, jobID, jobName string) string {
 	return value
 }
 
+// logArchiveDir returns the root directory for the deterministic "archive convention"
+// fallback. This is only used when Slurm metadata is not enough to resolve log paths.
+//
+// Default: ~/.slurm-dashboard/logs (often private to the user). For shared/team
+// readability, set SLURM_DASHBOARD_LOG_ARCHIVE_DIR to a shared directory.
 func logArchiveDir() string {
 	if configured := strings.TrimSpace(os.Getenv("SLURM_DASHBOARD_LOG_ARCHIVE_DIR")); configured != "" {
 		return expandHomePath(configured)
