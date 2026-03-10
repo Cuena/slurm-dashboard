@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -120,8 +121,17 @@ func (k KeyMap) FullHelp() [][]key.Binding {
 }
 
 type tickMsg time.Time
-type jobsMsg []Job
-type detailsMsg string
+type jobsMsg struct {
+	requestID int
+	mode      mode
+	jobs      []Job
+}
+type detailsMsg struct {
+	requestID int
+	jobID     string
+	history   bool
+	text      string
+}
 type errMsg error
 type refreshNowMsg struct{}
 type tailPathsMsg struct {
@@ -179,9 +189,11 @@ type Model struct {
 	lastRefresh time.Time
 	err         error
 
-	rawDetails   string // Store raw details for re-wrapping on resize
-	inputMode    bool   // if true, focus on filter input
-	mouseEnabled bool
+	rawDetails string // Store raw details for re-wrapping on resize
+	// Force a detail re-fetch after the next jobs refresh completes.
+	refreshSelectedDetails bool
+	inputMode              bool // if true, focus on filter input
+	mouseEnabled           bool
 
 	// Saved main-view mouse setting before entering tail view. Tail view may
 	// auto-disable mouse for easier text selection/copying.
@@ -189,6 +201,9 @@ type Model struct {
 
 	copyFeedback       string
 	copyFeedbackExpiry time.Time
+
+	jobsRequestID    int
+	detailsRequestID int
 }
 
 func NewModel() Model {
@@ -242,15 +257,16 @@ func NewModel() Model {
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(highlight)
 
 	m := Model{
-		table:        t,
-		detailsTable: dt,
-		filterInput:  ti,
-		help:         help.New(),
-		appMode:      modeLive,
-		sFilter:      filterAll,
-		fullColumns:  columns,
-		mouseEnabled: false,
-		historyDays:  historyDaysFromEnv(),
+		table:         t,
+		detailsTable:  dt,
+		filterInput:   ti,
+		help:          help.New(),
+		appMode:       modeLive,
+		sFilter:       filterAll,
+		fullColumns:   columns,
+		mouseEnabled:  false,
+		historyDays:   historyDaysFromEnv(),
+		jobsRequestID: 1,
 	}
 
 	width, height := detectTerminalSize()
@@ -283,7 +299,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// continues to refresh normally after exiting, but we avoid polling
 		// Slurm in the background.
 		if !m.paused && !m.inTailView {
-			cmds = append(cmds, m.fetchJobsCmd())
+			cmds = append(cmds, m.queueJobsFetchCmd())
 		}
 		cmds = append(cmds, m.tickCmd())
 
@@ -436,10 +452,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				// Re-trigger a job refresh when coming back
-				cmds = append(cmds, m.fetchJobsCmd())
+				cmds = append(cmds, m.queueJobsFetchCmd())
 				// Refresh details to clear "Resolving logs..." status
 				if m.selectedID != "" {
-					cmds = append(cmds, m.fetchDetailsCmd(m.selectedID))
+					cmds = append(cmds, m.queueDetailsFetchCmd(m.selectedID))
 				}
 			}
 			// Capture mouse toggle from tail view to keep state in sync
@@ -479,7 +495,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// Refresh details here too just in case
 			if m.selectedID != "" {
-				cmds = append(cmds, m.fetchDetailsCmd(m.selectedID))
+				cmds = append(cmds, m.queueDetailsFetchCmd(m.selectedID))
 			}
 			return m, tea.Batch(cmds...)
 		}
@@ -516,7 +532,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case jobsMsg:
-		m.jobs = msg
+		if msg.requestID != m.jobsRequestID || msg.mode != m.appMode {
+			break
+		}
+		m.jobs = msg.jobs
 		m.lastRefresh = time.Now()
 		m.loadingJobs = false
 		m.updateTable()
@@ -528,16 +547,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// If selection changed or we haven't loaded details yet (e.g. startup).
 			// When details are hidden (small window), avoid fetching details on every
 			// selection change; fetch on-demand when opening the overlay.
-			if id != m.selectedID || m.selectedID == "" {
+			if id != m.selectedID || m.selectedID == "" || m.refreshSelectedDetails {
 				m.selectedID = id
 				if !m.hideDetails {
-					cmds = append(cmds, m.fetchDetailsCmd(id))
+					cmds = append(cmds, m.queueDetailsFetchCmd(id))
 				}
 			}
 		}
+		m.refreshSelectedDetails = false
 
 	case detailsMsg:
-		m.rawDetails = string(msg)
+		if msg.requestID != m.detailsRequestID || msg.jobID != m.selectedID || msg.history != (m.appMode == modeHistory) {
+			break
+		}
+		m.rawDetails = msg.text
 		m.updateDetailsTable(m.rawDetails)
 
 	case tailPathsMsg:
@@ -561,7 +584,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case refreshNowMsg:
 		// Trigger a refresh without spawning another tick loop.
-		cmds = append(cmds, m.fetchJobsCmd())
+		cmds = append(cmds, m.queueJobsFetchCmd())
 
 	case tea.MouseMsg:
 		if msg.Type == tea.MouseLeft {
@@ -618,7 +641,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case key.Matches(msg, keys.Pause):
 				m.paused = !m.paused
 			case key.Matches(msg, keys.Refresh):
-				cmds = append(cmds, m.fetchJobsCmd())
+				m.refreshSelectedDetails = true
+				cmds = append(cmds, m.queueJobsFetchCmd())
 			case key.Matches(msg, keys.History):
 				m.loadingJobs = true
 				if m.appMode == modeLive {
@@ -626,7 +650,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.appMode = modeLive
 				}
-				cmds = append(cmds, m.fetchJobsCmd())
+				cmds = append(cmds, m.queueJobsFetchCmd())
 				cmds = append(cmds, func() tea.Msg {
 					return tea.WindowSizeMsg{Width: m.width, Height: m.height}
 				})
@@ -641,12 +665,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.inDetailsOverlay = true
 						m.detailsTable.Focus()
 						m.table.Blur()
-						cmds = append(cmds, m.fetchDetailsCmd(job.JobID))
+						cmds = append(cmds, m.queueDetailsFetchCmd(job.JobID))
 						// Force layout recalculation so the overlay columns fit the window.
 						m.applyWindowSize(m.width, m.height)
 						return m, tea.Batch(cmds...)
 					}
-					cmds = append(cmds, m.fetchDetailsCmd(job.JobID))
+					cmds = append(cmds, m.queueDetailsFetchCmd(job.JobID))
 				}
 			case key.Matches(msg, keys.CancelJob):
 				job := m.getSelectedJob()
@@ -724,7 +748,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if id != m.selectedID {
 				m.selectedID = id
 				if !m.hideDetails {
-					cmds = append(cmds, m.fetchDetailsCmd(id))
+					cmds = append(cmds, m.queueDetailsFetchCmd(id))
 				}
 			}
 		}
@@ -1623,53 +1647,132 @@ func (m *Model) updateDetailsTable(text string) {
 	m.detailsTable.SetRows(rows)
 }
 
-func parseDetailsToRows(text string) []table.Row {
-	var rows []table.Row
+var detailKeyPattern = regexp.MustCompile(`(?:^|\s)([A-Za-z][A-Za-z0-9_.:/-]*)=`)
 
+func parseDetailsToRows(text string) []table.Row {
 	// Handle potential error messages
 	if strings.HasPrefix(text, "Error") {
 		return []table.Row{{"Error", text}}
 	}
 
-	// Heuristic parsing for Key=Value pairs
-	// 1. Replace newlines with spaces to handle multi-line output effectively?
-	//    But 'scontrol show job' output is structured with newlines.
-	//    Let's process line by line.
+	rows := parseScontrolDetailsRows(text)
+	if len(rows) == 0 {
+		return []table.Row{{"Info", "No details found"}}
+	}
+	return prependPendingInsightRows(rows)
+}
 
-	lines := strings.Split(text, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+func parseScontrolDetailsRows(text string) []table.Row {
+	clean := strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
+	if clean == "" {
+		return nil
+	}
+
+	matches := detailKeyPattern.FindAllStringSubmatchIndex(clean, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	rows := make([]table.Row, 0, len(matches))
+	for i, match := range matches {
+		if len(match) < 4 {
 			continue
 		}
 
-		// Split by whitespace, but respect key=value
-		// This is naive.
-		// Better: Regex `(\w+(?:[:_]\w+)*)=`
-		// But we can just iterate fields.
-
-		fields := strings.Fields(line)
-		for _, field := range fields {
-			parts := strings.SplitN(field, "=", 2)
-			if len(parts) == 2 {
-				key := parts[0]
-				val := parts[1]
-				if val == "" {
-					val = "(empty)"
-				}
-				rows = append(rows, table.Row{key, val})
-			} else {
-				// Maybe part of previous value?
-				// For now, ignore or append to last row?
-				// Simple approach: if not k=v, ignore.
-			}
+		key := clean[match[2]:match[3]]
+		valueStart := match[1]
+		valueEnd := len(clean)
+		if i+1 < len(matches) {
+			valueEnd = matches[i+1][0]
 		}
+
+		value := strings.TrimSpace(clean[valueStart:valueEnd])
+		if value == "" {
+			value = "(empty)"
+		}
+		rows = append(rows, table.Row{key, value})
 	}
 
-	// Optimization: Filter out common boring keys if needed?
-	// For now show all.
-
 	return rows
+}
+
+func prependPendingInsightRows(rows []table.Row) []table.Row {
+	fields := detailRowsToMap(rows)
+	state := firstDetailValue(fields, "JobState", "State")
+	if !isPendingStateLabel(state) {
+		return rows
+	}
+
+	summary := []table.Row{}
+	appendPendingField := func(label string, skipUnknown bool, keys ...string) {
+		value := firstDetailValue(fields, keys...)
+		if value == "" {
+			return
+		}
+		if skipUnknown && isUnknownDetailValue(value) {
+			return
+		}
+		summary = append(summary, table.Row{label, value})
+	}
+
+	appendPendingField("PendingReason", false, "Reason")
+	appendPendingField("ExpectedStart", true, "StartTime")
+	appendPendingField("EligibleTime", true, "EligibleTime")
+	appendPendingField("SubmitTime", true, "SubmitTime")
+	appendPendingField("Priority", false, "Priority")
+
+	if len(summary) == 0 {
+		return rows
+	}
+
+	return append(summary, rows...)
+}
+
+func detailRowsToMap(rows []table.Row) map[string]string {
+	fields := make(map[string]string, len(rows))
+	for _, row := range rows {
+		if len(row) < 2 {
+			continue
+		}
+		key := strings.TrimSpace(row[0])
+		value := strings.TrimSpace(row[1])
+		if key == "" || value == "" {
+			continue
+		}
+		if _, exists := fields[key]; !exists {
+			fields[key] = value
+		}
+	}
+	return fields
+}
+
+func firstDetailValue(fields map[string]string, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(fields[key]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func isPendingStateLabel(state string) bool {
+	code := StateCode(state)
+	switch code {
+	case "PD", "CF", "PR", "RQ", "RS", "S", "ST", "RH", "RF":
+		return true
+	default:
+		return false
+	}
+}
+
+func isUnknownDetailValue(value string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(value))
+	switch normalized {
+	case "", "(EMPTY)", "NONE", "N/A", "UNKNOWN", "UNLIMITED":
+		return true
+	default:
+		return false
+	}
 }
 
 func parseHistoryDetailsToRows(text string) []table.Row {
@@ -1903,30 +2006,50 @@ func historyDaysFromEnv() int {
 }
 
 func (m Model) fetchJobsCmd() tea.Cmd {
+	requestID := m.jobsRequestID
+	requestMode := m.appMode
+	historyDays := m.historyDays
 	return func() tea.Msg {
-		if m.appMode == modeHistory {
-			jobs, err := FetchJobsHistory(m.historyDays)
+		if requestMode == modeHistory {
+			jobs, err := FetchJobsHistory(historyDays)
 			if err != nil {
 				return errMsg(err)
 			}
-			return jobsMsg(jobs)
+			return jobsMsg{requestID: requestID, mode: requestMode, jobs: jobs}
 		}
 		jobs, err := FetchJobsSqueue()
 		if err != nil {
 			return errMsg(err)
 		}
-		return jobsMsg(jobs)
+		return jobsMsg{requestID: requestID, mode: requestMode, jobs: jobs}
 	}
 }
 
 func (m Model) fetchDetailsCmd(id string) tea.Cmd {
+	requestID := m.detailsRequestID
+	history := m.appMode == modeHistory
 	return func() tea.Msg {
-		det, err := GetJobDetails(id, m.appMode == modeHistory)
+		det, err := GetJobDetails(id, history)
 		if err != nil {
-			return detailsMsg(fmt.Sprintf("Error fetching details: %v", err))
+			return detailsMsg{
+				requestID: requestID,
+				jobID:     id,
+				history:   history,
+				text:      fmt.Sprintf("Error fetching details: %v", err),
+			}
 		}
-		return detailsMsg(det)
+		return detailsMsg{requestID: requestID, jobID: id, history: history, text: det}
 	}
+}
+
+func (m *Model) queueJobsFetchCmd() tea.Cmd {
+	m.jobsRequestID++
+	return m.fetchJobsCmd()
+}
+
+func (m *Model) queueDetailsFetchCmd(id string) tea.Cmd {
+	m.detailsRequestID++
+	return m.fetchDetailsCmd(id)
 }
 
 func (m Model) cancelJobCmd(id string) tea.Cmd {

@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	osc52 "github.com/aymanbagabas/go-osc52/v2"
 	"github.com/charmbracelet/bubbles/key"
@@ -93,6 +94,7 @@ var tailKeys = TailKeyMap{
 }
 
 type logLineMsg struct {
+	session  uint64
 	pane     string // "stdout" or "stderr"
 	line     string
 	err      error
@@ -100,6 +102,7 @@ type logLineMsg struct {
 }
 
 type tailStartMsg struct {
+	session      uint64
 	pane         string
 	initialLines []string
 	reader       *bufio.Reader
@@ -110,6 +113,7 @@ type tailStartMsg struct {
 
 // TailModel handles the dual-pane log viewing
 type TailModel struct {
+	session    uint64
 	jobID      string
 	stdoutPath string
 	stderrPath string
@@ -220,6 +224,8 @@ var hiddenBorder = lipgloss.Border{
 
 const searchOverlayHeight = 4
 
+var tailSessionCounter atomic.Uint64
+
 var searchHighlightStyle = lipgloss.NewStyle().
 	Background(theme.SearchBg).
 	Foreground(theme.SearchFg).
@@ -232,6 +238,7 @@ var tailSelectionStyle = lipgloss.NewStyle().
 
 func NewTailModel(jobID, stdoutPath, stderrPath string, width, height int, mode TailMode) TailModel {
 	m := TailModel{
+		session:       nextTailSessionID(),
 		jobID:         jobID,
 		stdoutPath:    stdoutPath,
 		stderrPath:    stderrPath,
@@ -390,6 +397,10 @@ func (m TailModel) Init() tea.Cmd {
 		cmds = append(cmds, m.startTailCmd("stderr", m.stderrPath))
 	}
 	return tea.Batch(cmds...)
+}
+
+func nextTailSessionID() uint64 {
+	return tailSessionCounter.Add(1)
 }
 
 var ansiCursorRegexp = regexp.MustCompile(`\x1b\[[0-9;]*[A-KSTf]`)
@@ -1354,6 +1365,9 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tailStartMsg:
+		if msg.session != m.session {
+			break
+		}
 		// Set initial content in one shot to avoid visible "scrolling down" when
 		// loading a lot of historical lines.
 		if msg.pane == "stdout" {
@@ -1403,6 +1417,9 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case logLineMsg:
+		if msg.session != m.session {
+			break
+		}
 		lineHasContent := msg.err == nil || msg.line != ""
 
 		if msg.pane == "stdout" {
@@ -1760,7 +1777,8 @@ func (m *TailModel) startTailCmd(pane, path string) tea.Cmd {
 				archiveHint = fmt.Sprintf("  • No archived log found in %s", archiveDir)
 			}
 			return tailStartMsg{
-				pane: pane,
+				session: m.session,
+				pane:    pane,
 				initialLines: []string{
 					"⚠ No log path available",
 					"",
@@ -1814,7 +1832,7 @@ func (m *TailModel) startTailCmd(pane, path string) tea.Cmd {
 		// Create a pipe to capture both stdout and stderr
 		r, w, err := os.Pipe()
 		if err != nil {
-			return tailStartMsg{pane: pane, initialLines: initialLines, startErr: fmt.Errorf("creating pipe: %w", err)}
+			return tailStartMsg{session: m.session, pane: pane, initialLines: initialLines, startErr: fmt.Errorf("creating pipe: %w", err)}
 		}
 
 		cmd.Stdout = w
@@ -1823,7 +1841,7 @@ func (m *TailModel) startTailCmd(pane, path string) tea.Cmd {
 		if err := cmd.Start(); err != nil {
 			w.Close()
 			r.Close()
-			return tailStartMsg{pane: pane, initialLines: initialLines, startErr: err}
+			return tailStartMsg{session: m.session, pane: pane, initialLines: initialLines, startErr: err}
 		}
 
 		// Close write end in parent so that when child closes it (on exit), scanner sees EOF
@@ -1835,7 +1853,7 @@ func (m *TailModel) startTailCmd(pane, path string) tea.Cmd {
 		// Also, we need to keep the process reference somewhere if we want to kill it.
 		// Ideally, we wrap this in a struct that we pass back.
 
-		return tailStartMsg{pane: pane, initialLines: initialLines, reader: reader, cmd: cmd, pipe: r}
+		return tailStartMsg{session: m.session, pane: pane, initialLines: initialLines, reader: reader, cmd: cmd, pipe: r}
 	}
 }
 
@@ -1854,13 +1872,13 @@ func splitTailOutput(out []byte) []string {
 func (m *TailModel) waitForLine(pane string, reader *bufio.Reader) tea.Cmd {
 	return func() tea.Msg {
 		if reader == nil {
-			return logLineMsg{pane: pane, err: fmt.Errorf("log reader not initialized"), terminal: true}
+			return logLineMsg{session: m.session, pane: pane, err: fmt.Errorf("log reader not initialized"), terminal: true}
 		}
 
 		line, err := reader.ReadString('\n')
 		line = strings.TrimRight(line, "\r\n")
 
-		return logLineMsg{pane: pane, line: line, err: err, terminal: err != nil}
+		return logLineMsg{session: m.session, pane: pane, line: line, err: err, terminal: err != nil}
 	}
 }
 

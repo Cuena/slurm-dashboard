@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -132,5 +133,38 @@ func TestTailMouseWheelExtendsSelectionWhileDragging(t *testing.T) {
 	expectedLines := m.selectionCursor.line - m.selectionAnchor.line + 1
 	if gotLines := strings.Count(selected, "\n") + 1; gotLines != expectedLines {
 		t.Fatalf("expected %d selected lines, got %d", expectedLines, gotLines)
+	}
+}
+
+func TestTailIgnoresStaleSessionMessages(t *testing.T) {
+	stale := NewTailModel("1", "", "", 80, 12, TailModeStdout)
+	current := NewTailModel("1", "", "", 80, 12, TailModeStdout)
+	if stale.session == current.session {
+		t.Fatalf("expected distinct tail sessions, got %d", current.session)
+	}
+
+	current.stdoutLines = append(current.stdoutLines, "current line")
+	current.refreshStdoutContent()
+
+	model, _ := current.Update(tailStartMsg{
+		session:      stale.session,
+		pane:         "stdout",
+		initialLines: []string{"stale initial"},
+		startErr:     fmt.Errorf("stale"),
+	})
+	current = model.(TailModel)
+	if got := strings.Join(current.stdoutLines, "\n"); strings.Contains(got, "stale initial") {
+		t.Fatalf("stale start message should be ignored, got %q", got)
+	}
+
+	model, _ = current.Update(logLineMsg{
+		session:  stale.session,
+		pane:     "stdout",
+		err:      io.EOF,
+		terminal: true,
+	})
+	current = model.(TailModel)
+	if got := strings.Join(current.stdoutLines, "\n"); strings.Contains(got, "EOF (tail exited)") {
+		t.Fatalf("stale EOF should be ignored, got %q", got)
 	}
 }
