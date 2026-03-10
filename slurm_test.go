@@ -27,7 +27,6 @@ func TestParseSqueueOutput(t *testing.T) {
 }
 
 func TestParseSacctOutput(t *testing.T) {
-	// Real output from the audit - includes step entries
 	output := `34949712|vllm_glm4_6_tp16_ray_manual_4x4|bsc070916|CANCELLED by 4840|acc|00:40:07|4|as04r3b19,as04r5b[26-28]
 34952064|vllm_glm4_6_tp16_ray_manual_4x4|bsc070916|CANCELLED by 4840|acc|00:11:25|4|as02r3b[01-04]
 34989208|vllm_qwen2_5_72b_instruct_default_gpu4_tp4|bsc070916|RUNNING|acc|00:02:22|1|as02r3b15`
@@ -36,8 +35,6 @@ func TestParseSacctOutput(t *testing.T) {
 	if len(jobs) != 3 {
 		t.Fatalf("expected 3 jobs, got %d", len(jobs))
 	}
-
-	// parseSacct reverses order (newest first)
 	if jobs[0].JobID != "34989208" {
 		t.Errorf("expected job ID 34989208 first (most recent), got %s", jobs[0].JobID)
 	}
@@ -47,7 +44,6 @@ func TestParseSacctOutput(t *testing.T) {
 }
 
 func TestParseSacctSkipsStepEntries(t *testing.T) {
-	// Output that includes .batch and .extern step entries
 	output := `34989208|vllm_qwen2_5_72b|bsc070916|RUNNING|acc|00:02:22|1|as02r3b15
 34989208.batch|batch||RUNNING||00:02:22|1|as02r3b15
 34989208.extern|extern||RUNNING||00:02:22|1|as02r3b15`
@@ -103,6 +99,32 @@ func TestParseSubmitLineScriptPath(t *testing.T) {
 	}
 }
 
+func TestParseSubmitLineDirectivesHandlesQuotedValues(t *testing.T) {
+	submitLine := `sbatch --chdir "/scratch/my project" --output "logs/%x %j.out" --error=errs/%j.err train.sbatch`
+
+	got := parseSubmitLineDirectives(submitLine)
+
+	if got.chdir != "/scratch/my project" {
+		t.Fatalf("expected quoted chdir to be preserved, got %q", got.chdir)
+	}
+	if got.stdout != "logs/%x %j.out" {
+		t.Fatalf("expected quoted stdout path to be preserved, got %q", got.stdout)
+	}
+	if got.stderr != "errs/%j.err" {
+		t.Fatalf("expected stderr path, got %q", got.stderr)
+	}
+}
+
+func TestParseSubmitLineScriptPathHandlesQuotedFlags(t *testing.T) {
+	submitLine := `sbatch --wrap "python train.py --lr 1e-3" --chdir "/scratch/my project" scripts/run experiment.sbatch`
+
+	got := parseSubmitLineScriptPath(submitLine)
+
+	if got != "scripts/run" {
+		t.Fatalf("expected first positional script path, got %q", got)
+	}
+}
+
 func TestReadSbatchDirectives(t *testing.T) {
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "job.sbatch")
@@ -123,6 +145,26 @@ func TestReadSbatchDirectives(t *testing.T) {
 	}
 	if directives.chdir != "/work" {
 		t.Fatalf("expected chdir directive, got %q", directives.chdir)
+	}
+}
+
+func TestParseSbatchDirectivesHandlesQuotedDirectiveValues(t *testing.T) {
+	contents := `
+#SBATCH --output "logs/%x %j.out"
+#SBATCH --error errs/%j.err
+#SBATCH --chdir "/scratch/my project"
+`
+
+	got := parseSbatchDirectives(contents)
+
+	if got.stdout != "logs/%x %j.out" {
+		t.Fatalf("expected stdout directive to preserve spaces, got %q", got.stdout)
+	}
+	if got.stderr != "errs/%j.err" {
+		t.Fatalf("expected stderr directive, got %q", got.stderr)
+	}
+	if got.chdir != "/scratch/my project" {
+		t.Fatalf("expected chdir directive to preserve spaces, got %q", got.chdir)
 	}
 }
 

@@ -372,41 +372,13 @@ type sbatchDirectives struct {
 }
 
 func parseSubmitLineDirectives(submitLine string) sbatchDirectives {
-	return sbatchDirectives{
-		stdout: parseFlagValue(submitLine, outputFlagRe),
-		stderr: parseFlagValue(submitLine, errorFlagRe),
-		chdir:  parseFlagValue(submitLine, chdirFlagRe),
-	}
+	directives, _ := parseSbatchTokens(splitSubmitTokens(submitLine))
+	return directives
 }
 
 func parseSubmitLineScriptPath(submitLine string) string {
-	fields := strings.Fields(submitLine)
-	if len(fields) == 0 {
-		return ""
-	}
-
-	start := 0
-	for i, field := range fields {
-		if strings.Contains(field, "sbatch") {
-			start = i + 1
-			break
-		}
-	}
-
-	for i := start; i < len(fields); i++ {
-		field := fields[i]
-		if strings.HasPrefix(field, "-") {
-			if !strings.Contains(field, "=") {
-				if i+1 < len(fields) && submitLineFlagTakesValue(field) {
-					i++
-				}
-			}
-			continue
-		}
-		return strings.Trim(field, "\"'")
-	}
-
-	return ""
+	_, scriptPath := parseSbatchTokens(splitSubmitTokens(submitLine))
+	return scriptPath
 }
 
 func submitLineFlagTakesValue(flag string) bool {
@@ -434,17 +406,126 @@ func parseSbatchDirectives(contents string) sbatchDirectives {
 		if !strings.HasPrefix(trimmed, "#SBATCH") {
 			continue
 		}
+		lineDirectives, _ := parseSbatchTokens(splitDirectiveTokens(trimmed))
 		if directives.stdout == "" {
-			directives.stdout = parseFlagValue(trimmed, outputFlagRe)
+			directives.stdout = lineDirectives.stdout
 		}
 		if directives.stderr == "" {
-			directives.stderr = parseFlagValue(trimmed, errorFlagRe)
+			directives.stderr = lineDirectives.stderr
 		}
 		if directives.chdir == "" {
-			directives.chdir = parseFlagValue(trimmed, chdirFlagRe)
+			directives.chdir = lineDirectives.chdir
 		}
 	}
 	return directives
+}
+
+func splitSubmitTokens(text string) []string {
+	tokens := splitShellWords(text)
+	for i, token := range tokens {
+		if filepath.Base(token) == "sbatch" {
+			return tokens[i+1:]
+		}
+	}
+	return tokens
+}
+
+func splitDirectiveTokens(line string) []string {
+	trimmed := strings.TrimSpace(line)
+	trimmed = strings.TrimPrefix(trimmed, "#SBATCH")
+	return splitShellWords(strings.TrimSpace(trimmed))
+}
+
+func parseSbatchTokens(tokens []string) (sbatchDirectives, string) {
+	directives := sbatchDirectives{}
+
+	for i := 0; i < len(tokens); i++ {
+		token := tokens[i]
+		switch {
+		case token == "-o" || token == "--output":
+			if i+1 < len(tokens) {
+				directives.stdout = cleanSbatchValue(tokens[i+1])
+				i++
+			}
+		case strings.HasPrefix(token, "--output="):
+			directives.stdout = cleanSbatchValue(strings.TrimPrefix(token, "--output="))
+		case strings.HasPrefix(token, "-o") && len(token) > 2:
+			directives.stdout = cleanSbatchValue(token[2:])
+		case token == "-e" || token == "--error":
+			if i+1 < len(tokens) {
+				directives.stderr = cleanSbatchValue(tokens[i+1])
+				i++
+			}
+		case strings.HasPrefix(token, "--error="):
+			directives.stderr = cleanSbatchValue(strings.TrimPrefix(token, "--error="))
+		case strings.HasPrefix(token, "-e") && len(token) > 2:
+			directives.stderr = cleanSbatchValue(token[2:])
+		case token == "-D" || token == "--chdir":
+			if i+1 < len(tokens) {
+				directives.chdir = cleanSbatchValue(tokens[i+1])
+				i++
+			}
+		case strings.HasPrefix(token, "--chdir="):
+			directives.chdir = cleanSbatchValue(strings.TrimPrefix(token, "--chdir="))
+		case strings.HasPrefix(token, "-D") && len(token) > 2:
+			directives.chdir = cleanSbatchValue(token[2:])
+		case token == "--":
+			if i+1 < len(tokens) {
+				return directives, cleanSbatchValue(tokens[i+1])
+			}
+			return directives, ""
+		case strings.HasPrefix(token, "-"):
+			if !strings.Contains(token, "=") && submitLineFlagTakesValue(token) && i+1 < len(tokens) {
+				i++
+			}
+		default:
+			return directives, cleanSbatchValue(token)
+		}
+	}
+
+	return directives, ""
+}
+
+func splitShellWords(text string) []string {
+	var tokens []string
+	var current strings.Builder
+
+	inSingle := false
+	inDouble := false
+	escaped := false
+
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		tokens = append(tokens, current.String())
+		current.Reset()
+	}
+
+	for _, r := range text {
+		switch {
+		case escaped:
+			current.WriteRune(r)
+			escaped = false
+		case r == '\\' && !inSingle:
+			escaped = true
+		case r == '\'' && !inDouble:
+			inSingle = !inSingle
+		case r == '"' && !inSingle:
+			inDouble = !inDouble
+		case (r == ' ' || r == '\t' || r == '\n') && !inSingle && !inDouble:
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	if escaped {
+		current.WriteByte('\\')
+	}
+	flush()
+
+	return tokens
 }
 
 func parseFlagValue(text string, re *regexp.Regexp) string {
