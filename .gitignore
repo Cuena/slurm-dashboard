@@ -1,5 +1,6 @@
 .cache
 .gocache
 scripts/
+rsync-alogin1.local.sh
 
 slurm_test.go

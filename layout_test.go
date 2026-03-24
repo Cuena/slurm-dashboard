@@ -63,6 +63,34 @@ func TestViewFitsInWindow(t *testing.T) {
 	}
 }
 
+func TestEmptyViewFitsInWindow(t *testing.T) {
+	model := NewModel()
+	model.applyWindowSize(140, 36)
+
+	view := model.View()
+	vw, vh := measureView(view)
+	if vw > 140 {
+		t.Fatalf("view width %d exceeds window width %d", vw, 140)
+	}
+	if vh > 36 {
+		header := model.renderHeaderArea()
+		tablePanel := model.renderTablePanel()
+		detailsPanel := model.renderDetailsPanel()
+		mainView := model.renderMainContent(tablePanel, detailsPanel)
+		helpView := model.help.View(keys)
+		t.Fatalf(
+			"empty view height %d exceeds window height %d [header=%d main=%d help=%d table=%d details=%d]",
+			vh,
+			36,
+			lipgloss.Height(header),
+			lipgloss.Height(mainView),
+			lipgloss.Height(helpView),
+			lipgloss.Height(tablePanel),
+			lipgloss.Height(detailsPanel),
+		)
+	}
+}
+
 func sampleJobs() []Job {
 	return []Job{
 		{JobID: "101", Name: "train", User: "alice", Status: "RUNNING", Partition: "gpu", Time: "00:10:00", Nodes: "1", NodeList: "node001"},
@@ -101,5 +129,43 @@ func TestResponsiveTableColumnsFitHeaderWidth(t *testing.T) {
 		if headerWidth > contentWidth {
 			t.Fatalf("header width %d exceeds content width %d (columns=%v)", headerWidth, contentWidth, cols)
 		}
+	}
+}
+
+func TestJobsTableRenderUsesAllocatedHeight(t *testing.T) {
+	model := NewModel()
+	model.jobs = sampleJobs()
+	model.updateTable()
+	model.filtered = model.jobs
+	model.applyWindowSize(100, 30)
+
+	tableView := model.renderJobsTable()
+	if got, want := lipgloss.Height(tableView), model.table.Height()+1; got != want {
+		t.Fatalf("jobs table height = %d, want %d", got, want)
+	}
+}
+
+func TestSideBySidePanelsRenderSameHeight(t *testing.T) {
+	model := NewModel()
+	model.jobs = sampleJobs()
+	model.filtered = model.jobs
+	model.selectedID = model.jobs[0].JobID
+	model.lastRefresh = time.Now()
+	model.rawDetails = "JobID=101\nJobName=train\nUser=alice\nState=RUNNING"
+	model.updateTable()
+	model.updateDetailsTable(model.rawDetails)
+	if len(model.detailsTable.Rows()) > 0 {
+		model.detailsTable.SetCursor(0)
+	}
+
+	model.applyWindowSize(140, 36)
+	if model.hideDetails || model.stackPanels {
+		t.Fatalf("expected side-by-side layout, got hideDetails=%v stackPanels=%v", model.hideDetails, model.stackPanels)
+	}
+
+	tablePanel := model.renderTablePanel()
+	detailsPanel := model.renderDetailsPanel()
+	if got, want := lipgloss.Height(tablePanel), lipgloss.Height(detailsPanel); got != want {
+		t.Fatalf("panel heights differ: table=%d details=%d", got, want)
 	}
 }

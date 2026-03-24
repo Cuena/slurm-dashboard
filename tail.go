@@ -118,7 +118,7 @@ type TailModel struct {
 	stdoutPath string
 	stderrPath string
 
-	mode TailMode // New field
+	mode TailMode
 
 	stdoutView viewport.Model
 	stderrView viewport.Model
@@ -222,7 +222,10 @@ var hiddenBorder = lipgloss.Border{
 	BottomLeft:  " ",
 }
 
-const searchOverlayHeight = 4
+const (
+	searchOverlayHeight = 1
+	tailToolbarHeight   = 2
+)
 
 var tailSessionCounter atomic.Uint64
 
@@ -273,7 +276,7 @@ func NewTailModel(jobID, stdoutPath, stderrPath string, width, height int, mode 
 	ti.PromptStyle = lipgloss.NewStyle()
 	ti.TextStyle = lipgloss.NewStyle().Foreground(textStrong)
 	ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(subtle)
-	ti.Cursor.Style = lipgloss.NewStyle().Foreground(highlight)
+	ti.Cursor.Style = lipgloss.NewStyle().Foreground(focusBorder)
 	m.searchInput = ti
 
 	// Initialize viewports
@@ -320,8 +323,8 @@ func (m *TailModel) recalculateLayout() {
 		return
 	}
 
-	// height - 5 to be safe (Title + Border + Buffer)
-	vpHeight := m.height - 5
+	// Reserve space for the shared toolbar, pane chrome, and a small safety buffer.
+	vpHeight := m.height - 5 - tailToolbarHeight
 	if m.inSearchMode {
 		vpHeight -= searchOverlayHeight
 	}
@@ -1167,9 +1170,6 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.mode = TailModeBoth
-			// Optional: Restore mouse? Let's leave it to manual toggle or user preference
-			// m.mouseEnabled = true
-			// cmds = append(cmds, tea.EnableMouseCellMotion)
 			m.recalculateLayout()
 		case key.Matches(msg, tailKeys.NextPane):
 			if m.mode == TailModeBoth {
@@ -1602,6 +1602,7 @@ func (m TailModel) View() string {
 		return content
 	}
 
+	toolbar := m.renderToolbar()
 	var stdoutStyle, stderrStyle lipgloss.Style
 
 	// Determine styles based on active pane
@@ -1612,7 +1613,7 @@ func (m TailModel) View() string {
 		baseBorder = m.styles.Border.Copy().Border(hiddenBorder)
 	}
 
-	activeBorder := highlight
+	activeBorder := focusBorder
 	inactiveBorder := panelBorder
 
 	if m.mode == TailModeBoth {
@@ -1639,38 +1640,18 @@ func (m TailModel) View() string {
 			scroll = "Bot"
 		}
 
-		status := ""
-		if m.paused {
-			status = " [PAUSED]"
-		} else if m.following {
-			status = " [FOLLOW]"
-		}
-
-		if m.mouseEnabled {
-			status += " [MOUSE]"
-		}
-		if m.hasSelectionInPane(pane) {
-			status += " [SEL]"
-		}
-
-		// Add active indicator
 		prefix := "  "
 		if isActive {
-			prefix = "> "
+			prefix = "• "
 		}
-		name = prefix + name
+		label := prefix + name
 
-		// Calculate available width
-		// We want the header to fit within the viewport's width
-		// Let's use vp.Width as the target max width for the title line.
 		maxWidth := vp.Width
 		if maxWidth < 20 {
 			maxWidth = 20
-		} // Safety
+		}
 
-		// Fixed parts: "NAME  (SCROLL)STATUS"
-		// We need a separator space after name and before parens
-		fixedLen := lipgloss.Width(fmt.Sprintf("%s  (%s)%s", name, scroll, status))
+		fixedLen := lipgloss.Width(fmt.Sprintf("%s %s", label, scroll))
 
 		available := maxWidth - fixedLen
 
@@ -1678,27 +1659,27 @@ func (m TailModel) View() string {
 		if available < 3 {
 			displayPath = ""
 		} else if lipgloss.Width(path) > available {
-			// Truncate from start
-			// Use runes for correct slicing
 			r := []rune(path)
-			trim := len(r) - available + 1 // +1 for ellipsis
+			trim := len(r) - available + 1
 			if trim > 0 && trim < len(r) {
 				displayPath = "…" + string(r[trim:])
-			} else {
-				// Fallback if calculation off
-				if len(path) >= available {
-					displayPath = path[len(path)-available+1:]
-				}
 			}
 		}
 
-		// Style the header line
 		headerStyle := m.styles.Title.Copy()
 		if !isActive {
 			headerStyle = headerStyle.Foreground(theme.TextDim)
 		}
 
-		return headerStyle.Render(fmt.Sprintf("%s %s (%s)%s", name, displayPath, scroll, status))
+		parts := []string{
+			headerStyle.Render(label),
+			placeholderStyle.Render(displayPath),
+			metaMutedPillStyle.Render(scroll),
+		}
+		if m.hasSelectionInPane(pane) {
+			parts = append(parts, metaMutedPillStyle.Render("sel"))
+		}
+		return wrapSegments(parts, maxWidth, 1)
 	}
 
 	wrapIfSearch := func(content string) string {
@@ -1713,7 +1694,7 @@ func (m TailModel) View() string {
 			header("STDOUT", "stdout", m.stdoutPath, m.stdoutView, true),
 			stdoutStyle.Render(m.stdoutView.View()),
 		)
-		return wrapIfSearch(content)
+		return wrapIfSearch(lipgloss.JoinVertical(lipgloss.Left, toolbar, content))
 	}
 
 	if m.mode == TailModeStderr {
@@ -1721,7 +1702,7 @@ func (m TailModel) View() string {
 			header("STDERR", "stderr", m.stderrPath, m.stderrView, true),
 			stderrStyle.Render(m.stderrView.View()),
 		)
-		return wrapIfSearch(content)
+		return wrapIfSearch(lipgloss.JoinVertical(lipgloss.Left, toolbar, content))
 	}
 
 	// Determine active states for dual view
@@ -1739,31 +1720,78 @@ func (m TailModel) View() string {
 	)
 
 	if m.stacked {
-		return wrapIfSearch(lipgloss.JoinVertical(lipgloss.Left, left, right))
+		return wrapIfSearch(lipgloss.JoinVertical(lipgloss.Left, toolbar, left, right))
 	}
 
-	return wrapIfSearch(lipgloss.JoinHorizontal(lipgloss.Top, left, right))
+	content := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+	return wrapIfSearch(lipgloss.JoinVertical(lipgloss.Left, toolbar, content))
+}
+
+func (m TailModel) renderToolbar() string {
+	tab := func(label string, active bool) string {
+		style := toolbarTabStyle
+		if active {
+			style = toolbarActiveStyle
+		}
+		return style.Render(label)
+	}
+
+	modeTabs := []string{
+		tab("stdout", m.mode == TailModeStdout),
+		tab("stderr", m.mode == TailModeStderr),
+		tab("split", m.mode == TailModeBoth),
+	}
+
+	status := []string{toolbarBrandStyle.Render("logs"), joinWithGap(modeTabs, 1)}
+	if m.jobID != "" {
+		status = append(status, metaMutedPillStyle.Render("job "+m.jobID))
+	}
+	if m.paused {
+		status = append(status, metaPillStyle.Copy().Background(accentOrange).Foreground(textOnAccent).Render("paused"))
+	} else if m.following {
+		status = append(status, metaMutedPillStyle.Render("follow"))
+	}
+	if m.mode == TailModeBoth {
+		layout := "columns"
+		if m.stacked {
+			layout = "stack"
+		}
+		status = append(status, metaMutedPillStyle.Render(layout))
+		focusPane := "stdout"
+		if m.activePane == 1 {
+			focusPane = "stderr"
+		}
+		status = append(status, metaMutedPillStyle.Render("focus "+focusPane))
+	}
+	if m.mouseEnabled {
+		status = append(status, metaMutedPillStyle.Render("mouse"))
+	}
+	if m.inSearchMode {
+		status = append(status, metaMutedPillStyle.Render("search"))
+	}
+
+	return wrapSegments(status, m.width, 1)
 }
 
 func (m TailModel) renderSearchOverlay(content string) string {
 	rawValue := m.searchInput.Value()
 	displayValue := strings.TrimSpace(rawValue)
 	if displayValue == "" {
-		displayValue = "(type to search)"
+		displayValue = "type to search"
 	}
 	if m.searchInput.Focused() {
 		displayValue += " ▍"
 	}
 
-	builder := &strings.Builder{}
-	builder.WriteString("\n/ Search: ")
-	builder.WriteString(displayValue)
-	builder.WriteString("\n")
-	builder.WriteString("Press Enter to jump, Esc to cancel")
-	builder.WriteString("\n\n")
-	builder.WriteString(content)
-
-	return builder.String()
+	hint := "enter jump  esc close"
+	if m.width >= 72 {
+		hint = "enter jump  esc close  n/N cycle"
+	}
+	bar := wrapSegments([]string{
+		searchHighlightStyle.Render("/ " + displayValue),
+		metaMutedPillStyle.Render(hint),
+	}, m.width, 1)
+	return lipgloss.JoinVertical(lipgloss.Left, content, bar)
 }
 
 // Commands

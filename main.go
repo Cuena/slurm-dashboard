@@ -22,17 +22,11 @@ import (
 )
 
 const (
-	refreshInterval    = 5 * time.Second
-	version            = "v0.2.1"
-	panelGap           = 2 // Slightly smaller gap looks cleaner
-	stackedPanelGap    = 1
-	minContentHeight   = 5
-	defaultHistoryDays = 3
-	envHistoryDays     = "SLURM_DASHBOARD_HISTORY_DAYS"
-	// CHANGED: Increased from 6 to 8.
-	// This reserves more space for borders/padding so they don't get pushed out.
-	panelChromeWidth = 8
-	// CHANGED: Reduced to allow resizing on smaller screens
+	refreshInterval      = 5 * time.Second
+	panelGap             = 2 // Slightly smaller gap looks cleaner
+	defaultHistoryDays   = 3
+	envHistoryDays       = "SLURM_DASHBOARD_HISTORY_DAYS"
+	panelChromeWidth     = 8
 	minTablePanelWidth   = 30
 	minDetailsPanelWidth = 20
 	maxDetailsPanelWidth = 50
@@ -226,6 +220,7 @@ func NewModel() Model {
 
 	s := table.DefaultStyles()
 	s.Header = tableHeaderStyle
+	s.Cell = tableCellStyle
 	s.Selected = tableSelectedStyle
 	t.SetStyles(s)
 
@@ -242,19 +237,20 @@ func NewModel() Model {
 
 	dtStyles := table.DefaultStyles()
 	dtStyles.Header = tableHeaderStyle
+	dtStyles.Cell = tableCellStyle
 	dtStyles.Selected = tableSelectedStyle
 	dt.SetStyles(dtStyles)
 
 	// Input setup
 	ti := textinput.New()
-	ti.Placeholder = "Filter"
+	ti.Placeholder = "/ filter"
 	ti.CharLimit = 50
 	ti.Width = 20
 	ti.Prompt = ""
 	ti.PromptStyle = lipgloss.NewStyle().Foreground(subtle)
 	ti.TextStyle = lipgloss.NewStyle().Foreground(textStrong)
 	ti.PlaceholderStyle = lipgloss.NewStyle().Foreground(subtle)
-	ti.Cursor.Style = lipgloss.NewStyle().Foreground(highlight)
+	ti.Cursor.Style = lipgloss.NewStyle().Foreground(focusBorder)
 
 	m := Model{
 		table:         t,
@@ -279,7 +275,6 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.fetchJobsCmd(),
 		m.tickCmd(),
-		tea.DisableMouse,
 		initialWindowSizeCmd(),
 	)
 }
@@ -543,12 +538,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Sync selection immediately
 		sel := m.table.SelectedRow()
 		if len(sel) > 0 {
-			id := sel[0]
+			id := jobIDFromTableRow(sel)
 			// If selection changed or we haven't loaded details yet (e.g. startup).
 			// When details are hidden (small window), avoid fetching details on every
 			// selection change; fetch on-demand when opening the overlay.
 			if id != m.selectedID || m.selectedID == "" || m.refreshSelectedDetails {
 				m.selectedID = id
+				m.updateTable()
 				if !m.hideDetails {
 					cmds = append(cmds, m.queueDetailsFetchCmd(id))
 				}
@@ -744,9 +740,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		sel := m.table.SelectedRow()
 		if len(sel) > 0 {
-			id := sel[0]
+			id := jobIDFromTableRow(sel)
 			if id != m.selectedID {
 				m.selectedID = id
+				m.updateTable()
 				if !m.hideDetails {
 					cmds = append(cmds, m.queueDetailsFetchCmd(id))
 				}
@@ -794,16 +791,9 @@ func (m Model) View() string {
 		mainView = m.renderMainContent(tablePanel, detailsPanel)
 	}
 
-	var helpKeys help.KeyMap = keys
-	if m.inTailView {
-		helpKeys = tailKeys
-	}
-	helpSection := m.help.View(helpKeys)
+	helpSection := m.help.View(keys)
 
 	sections := []string{header, mainView, helpSection}
-	if hint := m.filterHint(); hint != "" {
-		sections = append(sections, hint)
-	}
 	if hint := m.detailsHiddenHint(); hint != "" {
 		sections = append(sections, hint)
 	}
@@ -815,63 +805,67 @@ func (m Model) View() string {
 }
 
 func (m Model) renderHeaderArea() string {
-	modeStr := "Live"
-	if m.appMode == modeHistory {
-		modeStr = "History"
+	tab := func(label string, active bool) string {
+		style := toolbarTabStyle
+		if active {
+			style = toolbarActiveStyle
+		}
+		return style.Render(label)
 	}
 
-	filterInput := filterBoxStyle.Render(m.filterInput.View())
+	modeTabs := joinWithGap([]string{
+		tab("live", m.appMode != modeHistory),
+		tab("history", m.appMode == modeHistory),
+	}, 1)
+
+	focusTarget := "jobs"
+	if m.inputMode {
+		focusTarget = "filter"
+	} else if !m.hideDetails && m.detailsTable.Focused() {
+		focusTarget = "details"
+	}
+
 	required := []string{
-		filterInput,
-		metaMutedPillStyle.Render("Status " + m.sFilter.String()),
-		metaPillStyle.Render("Mode " + modeStr),
+		toolbarBrandStyle.Render("slurm"),
+		modeTabs,
+		filterBoxStyle.Render(m.filterInput.View()),
+		toolbarDividerStyle.Render("|"),
+		toolbarMetaStyle.Render(fmt.Sprintf("jobs %d", len(m.filtered))),
+		toolbarMetaStyle.Render("focus " + focusTarget),
 	}
-
+	optional := []string{}
+	if m.sFilter != filterAll {
+		optional = append(optional, toolbarMetaStyle.Render("state "+strings.ToLower(m.sFilter.String())))
+	}
+	if query := strings.TrimSpace(m.filterInput.Value()); query != "" {
+		optional = append(optional, toolbarMetaStyle.Render("find "+trimDetailValueToWidth(query, 18)))
+	}
+	if compact := m.jobStatsCompactPill(); compact != "" {
+		optional = append(optional, compact)
+	}
+	if !m.lastRefresh.IsZero() {
+		optional = append(optional, toolbarMetaStyle.Render("updated "+m.lastRefresh.Format("15:04:05")))
+	}
 	if m.paused {
-		required = append(required, metaMutedPillStyle.Copy().Background(accentOrange).Render("Paused"))
+		required = append(required, metaPillStyle.Copy().Background(accentOrange).Foreground(textOnAccent).Render("paused"))
 	}
 	if m.err != nil {
-		errText := fmt.Sprintf("Error %s", shortenText(m.err.Error(), 32))
+		errText := fmt.Sprintf("error %s", shortenText(m.err.Error(), 28))
 		required = append(required, metaAlertPillStyle.Render(errText))
 	}
-
-	optional := []string{}
-
-	// Job stats: chips in wide terminals, compact pill in medium ones.
-	if m.width >= 120 {
-		optional = append(optional, joinWithGap(m.jobStatChips(), 0))
-	} else if m.width >= 90 {
-		if compact := m.jobStatsCompactPill(); compact != "" {
-			optional = append(optional, compact)
-		}
-	}
-
-	if !m.lastRefresh.IsZero() {
-		optional = append(optional, metaMutedPillStyle.Render("Updated "+m.lastRefresh.Format("15:04:05")))
-	}
-	mouseState := "Mouse Off"
 	if m.mouseEnabled {
-		mouseState = "Mouse On"
-	}
-	optional = append(optional, metaMutedPillStyle.Render(mouseState))
-
-	// Keep a one-line header by dropping optional items until it fits.
-	parts := append([]string{}, required...)
-	parts = append(parts, optional...)
-	for len(parts) > 0 && lipgloss.Width(joinWithGap(parts, 1)) > m.width {
-		// Drop lowest priority item (last).
-		parts = parts[:len(parts)-1]
+		optional = append(optional, metaMutedPillStyle.Render("mouse"))
 	}
 
-	row := joinWithGap(parts, 1)
-	return lipgloss.NewStyle().MaxWidth(m.width).Render(row)
-}
-
-func (m Model) filterHint() string {
-	if m.inputMode || m.filterInput.Value() != "" {
-		return ""
+	parts := append(append([]string{}, required...), optional...)
+	for len(optional) > 0 && m.width > 0 && lipgloss.Width(joinWithGap(parts, 1)) > m.width {
+		optional = optional[:len(optional)-1]
+		parts = append(append([]string{}, required...), optional...)
 	}
-	return lipgloss.NewStyle().MaxWidth(m.width).Render(filterHintStyle.Render("Press '/' to focus the filter"))
+	if m.width <= 0 || lipgloss.Width(joinWithGap(parts, 1)) <= m.width {
+		return lipgloss.NewStyle().MaxWidth(m.width).Render(joinWithGap(parts, 1))
+	}
+	return lipgloss.NewStyle().MaxWidth(m.width).Render(wrapSegments(parts, m.width, 1))
 }
 
 func (m Model) detailsHiddenHint() string {
@@ -879,16 +873,12 @@ func (m Model) detailsHiddenHint() string {
 		return ""
 	}
 	return lipgloss.NewStyle().MaxWidth(m.width).Render(
-		filterHintStyle.Render("Details hidden in small window - press 'i' or Enter to open"),
+		filterHintStyle.Render("Press i to open details"),
 	)
 }
 
 func (m Model) tablePanelTitle() string {
-	title := panelTitleStyle.Render(fmt.Sprintf("Jobs (%d)", len(m.filtered)))
-	if m.table.Focused() && !m.inputMode {
-		title = lipgloss.JoinHorizontal(lipgloss.Left, title, focusTagStyle.Render("Jobs Focused"))
-	}
-	return title
+	return ""
 }
 
 func (m Model) jobStatsCompactPill() string {
@@ -912,7 +902,7 @@ func (m Model) jobStatsCompactPill() string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return metaMutedPillStyle.Render(strings.Join(parts, " "))
+	return toolbarMetaStyle.Render(strings.Join(parts, " "))
 }
 
 func (m Model) renderTablePanel() string {
@@ -923,37 +913,151 @@ func (m Model) renderTablePanel() string {
 
 	tableFocused := m.table.Focused() && !m.inputMode
 	if tableFocused {
-		tableStyle = tableStyle.BorderForeground(highlight).Background(panelBg)
+		tableStyle = tableStyle.BorderForeground(focusBorder).Background(panelBg)
 	}
 
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		m.tablePanelTitle(),
-		tableStyle.Render(m.table.View()),
-	)
+	content := m.renderJobsTable()
+	if m.tablePanelHeight > 0 {
+		_, frameHeight := m.tableBoxStyle().GetFrameSize()
+		content = padBlockHeight(content, m.tablePanelHeight-frameHeight)
+	}
+
+	if title := m.tablePanelTitle(); strings.TrimSpace(title) != "" {
+		return lipgloss.JoinVertical(
+			lipgloss.Left,
+			title,
+			tableStyle.Render(content),
+		)
+	}
+	return tableStyle.Render(content)
+}
+
+func (m Model) renderJobsTable() string {
+	cols := m.table.Columns()
+	rows := m.table.Rows()
+	if len(cols) == 0 {
+		return ""
+	}
+
+	headerCells := make([]string, 0, len(cols))
+	for _, col := range cols {
+		if col.Width <= 0 {
+			continue
+		}
+		headerCells = append(headerCells, renderJobsTableCell(col.Title, col.Width, tableHeaderStyle))
+	}
+	header := lipgloss.JoinHorizontal(lipgloss.Top, headerCells...)
+
+	height := m.table.Height()
+	if height <= 0 {
+		height = len(rows)
+	}
+	if height <= 0 {
+		height = 1
+	}
+
+	cursor := m.table.Cursor()
+	if cursor < 0 {
+		cursor = 0
+	}
+	if len(rows) > 0 && cursor >= len(rows) {
+		cursor = len(rows) - 1
+	}
+
+	start := 0
+	end := 0
+	if len(rows) > 0 {
+		start = cursor - height/2
+		if start < 0 {
+			start = 0
+		}
+		maxStart := len(rows) - height
+		if maxStart < 0 {
+			maxStart = 0
+		}
+		if start > maxStart {
+			start = maxStart
+		}
+		end = start + height
+		if end > len(rows) {
+			end = len(rows)
+		}
+	}
+
+	body := make([]string, 0, height)
+	rowStyle := tableCellStyle
+	if !m.table.Focused() || m.inputMode {
+		rowStyle = tableCellStyle.Copy().Foreground(subtle)
+	}
+	selectedStyle := jobsTableSelectedCellStyle
+	if !m.table.Focused() || m.inputMode {
+		selectedStyle = jobsTableSelectedMutedCellStyle
+	}
+
+	if len(rows) == 0 {
+		body = append(body, placeholderStyle.Render("No jobs to display."))
+	} else {
+		for rowIdx := start; rowIdx < end; rowIdx++ {
+			row := rows[rowIdx]
+			isSelected := rowIdx == cursor
+			cells := make([]string, 0, len(cols))
+			for colIdx, col := range cols {
+				if col.Width <= 0 {
+					continue
+				}
+				value := ""
+				if colIdx < len(row) {
+					value = row[colIdx]
+				}
+				style := rowStyle
+				if isSelected {
+					style = selectedStyle
+				}
+				cells = append(cells, renderJobsTableCell(value, col.Width, style))
+			}
+			body = append(body, lipgloss.JoinHorizontal(lipgloss.Top, cells...))
+		}
+	}
+
+	for len(body) < height {
+		cells := make([]string, 0, len(cols))
+		for _, col := range cols {
+			if col.Width <= 0 {
+				continue
+			}
+			cells = append(cells, renderJobsTableCell("", col.Width, rowStyle))
+		}
+		body = append(body, lipgloss.JoinHorizontal(lipgloss.Top, cells...))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, append([]string{header}, body...)...)
+}
+
+func renderJobsTableCell(value string, width int, style lipgloss.Style) string {
+	cell := lipgloss.NewStyle().Width(width).MaxWidth(width).Inline(true)
+	return style.Render(cell.Render(runewidth.Truncate(value, width, "…")))
 }
 
 func (m Model) detailsPanelTitle() string {
-	title := panelTitleStyle.Render("Details")
-	if m.detailsTable.Focused() {
-		title = lipgloss.JoinHorizontal(lipgloss.Left, title, focusTagStyle.Render("Details Focused"))
-	} else {
-		hint := placeholderStyle.Copy().MarginLeft(1).Render("Press TAB to scroll")
-		title = lipgloss.JoinHorizontal(lipgloss.Left, title, hint)
+	parts := []string{panelTitleStyle.Render("Details")}
+	if job := m.getSelectedJob(); job != nil {
+		parts = append(parts, panelMetaStyle.Render(job.JobID))
 	}
-	return title
+	if m.detailsTable.Focused() {
+		parts = append(parts, focusTagStyle.Render("focus"))
+	} else if m.getSelectedJob() != nil {
+		parts = append(parts, panelMetaStyle.Render("tab scroll"))
+	}
+	return joinWithGap(parts, 1)
 }
 
 func (m Model) renderDetailsPanel() string {
 	title := m.detailsPanelTitle()
 
-	// FIX 3: Change .MaxWidth() to .Width()
-	// This forces Lipgloss to draw the box at exactly this size,
-	// preventing it from shrinking or behaving unpredictably.
 	panelStyle := m.detailsBoxStyle().Width(m.detailsBlockWidth)
 
 	if m.detailsTable.Focused() {
-		panelStyle = panelStyle.BorderForeground(highlight).Background(panelBg)
+		panelStyle = panelStyle.BorderForeground(focusBorder).Background(panelBg)
 	}
 
 	detailsContent := m.detailsTable.View()
@@ -961,15 +1065,25 @@ func (m Model) renderDetailsPanel() string {
 		detailsContent = placeholderStyle.Render("Details will appear here once a job is selected.")
 	}
 
+	contentParts := []string{}
+	if summary, _ := m.buildSelectedJobSummary(); summary != "" {
+		contentParts = append(contentParts, summary)
+	}
+	contentParts = append(contentParts, detailsContent)
 	if inspector, _ := m.buildDetailInspector(); inspector != "" {
-		detailsContent = lipgloss.JoinVertical(lipgloss.Left, detailsContent, inspector)
+		contentParts = append(contentParts, inspector)
+	}
+	detailsContent = lipgloss.JoinVertical(lipgloss.Left, contentParts...)
+
+	if strings.TrimSpace(title) != "" {
+		detailsContent = lipgloss.JoinVertical(lipgloss.Left, title, detailsContent)
+	}
+	if m.detailsPanelHeight > 0 {
+		_, frameHeight := m.detailsBoxStyle().GetFrameSize()
+		detailsContent = padBlockHeight(detailsContent, m.detailsPanelHeight-frameHeight)
 	}
 
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		title,
-		panelStyle.Render(detailsContent),
-	)
+	return panelStyle.Render(detailsContent)
 }
 
 func (m Model) viewDetailsOverlay() string {
@@ -1091,6 +1205,15 @@ func (m Model) renderMainContent(tablePanel, detailsPanel string) string {
 		return lipgloss.JoinVertical(lipgloss.Left, tablePanel, detailsPanel)
 	}
 
+	targetHeight := lipgloss.Height(tablePanel)
+	if detailsHeight := lipgloss.Height(detailsPanel); detailsHeight > targetHeight {
+		targetHeight = detailsHeight
+	}
+	if targetHeight > 0 {
+		tablePanel = lipgloss.NewStyle().Height(targetHeight).Render(tablePanel)
+		detailsPanel = lipgloss.NewStyle().Height(targetHeight).Render(detailsPanel)
+	}
+
 	gap := lipgloss.NewStyle().Width(panelGap).Render(" ")
 	return lipgloss.JoinHorizontal(lipgloss.Top, tablePanel, gap, detailsPanel)
 }
@@ -1156,13 +1279,44 @@ func (m Model) buildDetailInspector() (string, int) {
 	return view, lipgloss.Height(view)
 }
 
+func (m Model) buildSelectedJobSummary() (string, int) {
+	job := m.getSelectedJob()
+	if job == nil {
+		return "", 0
+	}
+
+	fields := detailRowsToMap(m.detailsTable.Rows())
+	parts := []string{
+		renderDetailSummaryMetric("state", renderStateBadge(job.State(), job.Status)),
+		renderDetailSummaryMetric("name", trimDetailValueToWidth(job.Name, 28)),
+	}
+	if job.Partition != "" {
+		parts = append(parts, renderDetailSummaryMetric("partition", job.Partition))
+	}
+	if job.Nodes != "" {
+		parts = append(parts, renderDetailSummaryMetric("nodes", job.Nodes))
+	}
+	if job.Time != "" {
+		parts = append(parts, renderDetailSummaryMetric("time", job.Time))
+	}
+	if reason := firstDetailValue(fields, "PendingReason", "Reason"); reason != "" && !isUnknownDetailValue(reason) && job.IsPending() {
+		parts = append(parts, renderDetailSummaryMetric("reason", trimDetailValueToWidth(reason, 24)))
+	}
+
+	summary := wrapSegments(parts, m.detailsContentWidth, 1)
+	style := detailSummaryStyle.Copy()
+	if m.detailsContentWidth > 0 {
+		style = style.Width(m.detailsContentWidth)
+	}
+	view := style.Render(summary)
+	return view, lipgloss.Height(view)
+}
+
 func detailInspectorHintText(width int) string {
 	switch {
-	case width >= 42:
-		return "Press v to view full value  •  Ctrl+Y to copy"
-	case width >= 28:
-		return "v view value  •  Ctrl+Y copy"
-	case width >= 16:
+	case width >= 30:
+		return "v view full  •  Ctrl+Y copy"
+	case width >= 18:
 		return "v view  •  ^Y copy"
 	default:
 		return "v/^Y"
@@ -1232,9 +1386,24 @@ func clampViewHeight(view string, height int) string {
 	return strings.Join(lines[:height], "\n")
 }
 
+func padBlockHeight(view string, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(strings.ReplaceAll(view, "\r\n", "\n"), "\n")
+	if len(lines) >= height {
+		return strings.Join(lines[:height], "\n")
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (m *Model) applyPanelHeights() {
 	tableHeight := m.tablePanelHeight
 	detailsHeight := m.detailsPanelHeight
+	const tableHeaderHeight = 1
 
 	if tableHeight < 0 {
 		tableHeight = 0
@@ -1245,7 +1414,7 @@ func (m *Model) applyPanelHeights() {
 
 	tableTitleHeight := lipgloss.Height(m.tablePanelTitle())
 	_, tableFrameHeight := m.tableBoxStyle().GetFrameSize()
-	tableContentHeight := tableHeight - tableTitleHeight - tableFrameHeight
+	tableContentHeight := tableHeight - tableTitleHeight - tableFrameHeight - tableHeaderHeight
 	if tableContentHeight < 0 {
 		tableContentHeight = 0
 	}
@@ -1253,8 +1422,12 @@ func (m *Model) applyPanelHeights() {
 
 	detailsTitleHeight := lipgloss.Height(m.detailsPanelTitle())
 	_, detailsFrameHeight := m.detailsBoxStyle().GetFrameSize()
+	_, summaryHeight := m.buildSelectedJobSummary()
 	_, inspectorHeight := m.buildDetailInspector()
-	detailsContentHeight := detailsHeight - detailsTitleHeight - detailsFrameHeight
+	detailsContentHeight := detailsHeight - detailsTitleHeight - detailsFrameHeight - tableHeaderHeight
+	if summaryHeight > 0 {
+		detailsContentHeight -= summaryHeight
+	}
 	if inspectorHeight > 0 {
 		detailsContentHeight -= inspectorHeight
 	}
@@ -1291,12 +1464,7 @@ func (m *Model) applyWindowSize(width, height int) {
 	// --- 2. VERTICAL HEIGHT CALCULATION ---
 	headerHeight := lipgloss.Height(m.renderHeaderArea())
 	helpHeight := lipgloss.Height(m.help.View(keys))
-	hintHeight := 0
-	if hint := m.filterHint(); hint != "" {
-		hintHeight = lipgloss.Height(hint)
-	}
-
-	reserved := headerHeight + helpHeight + hintHeight
+	reserved := headerHeight + helpHeight
 	availableHeight := height - reserved
 	if availableHeight < 0 {
 		availableHeight = 0
@@ -1306,8 +1474,6 @@ func (m *Model) applyWindowSize(width, height int) {
 
 	safeWidth := width
 
-	// FIX: Use -6 buffer.
-	// This ensures the rightmost border is definitely within the screen bounds.
 	usable := safeWidth - panelGap - 6
 
 	if usable < 1 {
@@ -1475,44 +1641,6 @@ func (m Model) collectJobStats() jobStats {
 	return stats
 }
 
-func (m Model) jobStatChips() []string {
-	stats := m.collectJobStats()
-	metrics := []struct {
-		short string
-		label string
-		icon  string
-		value int
-		color lipgloss.TerminalColor
-	}{
-		{"R", "Running", "▶", stats.Running, accentGreen},
-		{"P", "Pending", "…", stats.Pending, accentOrange},
-		{"C", "Completed", "✓", stats.Completed, accentBlue},
-		{"F", "Failed", "!", stats.Failed, accentPink},
-		{"O", "Other", "?", stats.Other, accentCyan},
-	}
-
-	var chips []string
-	for _, metric := range metrics {
-		if metric.label == "Other" && metric.value == 0 {
-			continue
-		}
-
-		value := summaryValueStyle.Copy().Foreground(metric.color).Render(fmt.Sprintf("%s %d", metric.icon, metric.value))
-		content := lipgloss.JoinHorizontal(
-			lipgloss.Left,
-			summaryLabelStyle.Render(metric.short),
-			lipgloss.NewStyle().MarginLeft(1).Render(value),
-		)
-		chips = append(chips, summaryChipStyle.Copy().BorderForeground(metric.color).Render(content))
-	}
-
-	if len(chips) == 0 {
-		chips = append(chips, summaryChipStyle.Render(placeholderStyle.Render("No jobs to display")))
-	}
-
-	return chips
-}
-
 func (m Model) responsiveTableColumns(contentWidth int) []table.Column {
 	// Build a column set that degrades gracefully in small windows.
 	// We keep Name flexible to absorb extra space.
@@ -1569,11 +1697,12 @@ func tableColumnFrameWidth() int {
 	// Both header and body cells add horizontal frame (padding/border/margins).
 	// Account for the larger one so computed columns don't wrap onto a second line.
 	headerFrame := tableHeaderStyle.GetHorizontalFrameSize()
-	cellFrame := table.DefaultStyles().Cell.GetHorizontalFrameSize()
-	if cellFrame > headerFrame {
-		return cellFrame
+	cellFrame := tableCellStyle.GetHorizontalFrameSize()
+	maxFrame := headerFrame
+	if cellFrame > maxFrame {
+		maxFrame = cellFrame
 	}
-	return headerFrame
+	return maxFrame
 }
 
 func joinWithGap(parts []string, gap int) string {
@@ -1599,6 +1728,58 @@ func joinWithGap(parts []string, gap int) string {
 		row = lipgloss.JoinHorizontal(lipgloss.Left, row, spacer, part)
 	}
 	return row
+}
+
+func wrapSegments(parts []string, width, gap int) string {
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		filtered = append(filtered, part)
+	}
+	if len(filtered) == 0 {
+		return ""
+	}
+	if width <= 0 {
+		return joinWithGap(filtered, gap)
+	}
+
+	lines := []string{}
+	current := []string{}
+	currentWidth := 0
+	for _, part := range filtered {
+		partWidth := lipgloss.Width(part)
+		addedWidth := partWidth
+		if len(current) > 0 {
+			addedWidth += gap
+		}
+		if len(current) > 0 && currentWidth+addedWidth > width {
+			lines = append(lines, joinWithGap(current, gap))
+			current = []string{part}
+			currentWidth = partWidth
+			continue
+		}
+		current = append(current, part)
+		currentWidth += addedWidth
+	}
+	if len(current) > 0 {
+		lines = append(lines, joinWithGap(current, gap))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+func renderDetailSummaryMetric(label, value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return summaryChipStyle.Render(
+		lipgloss.JoinHorizontal(
+			lipgloss.Left,
+			detailSummaryLabelStyle.Render(label),
+			lipgloss.NewStyle().MarginLeft(1).Render(detailSummaryValueStyle.Render(value)),
+		),
+	)
 }
 
 func renderStateBadge(state, label string) string {
@@ -1864,14 +2045,12 @@ func parseHistoryDetailsToRows(text string) []table.Row {
 }
 
 func (m *Model) getSelectedJob() *Job {
-	// Always query the table for the currently selected row to ensure we have the latest selection
-	// and to avoid issues where m.selectedID might be stale or uninitialized.
 	sel := m.table.SelectedRow()
 	if len(sel) == 0 {
 		return nil
 	}
 
-	id := sel[0]
+	id := jobIDFromTableRow(sel)
 	for i := range m.jobs {
 		if m.jobs[i].JobID == id {
 			return &m.jobs[i]
@@ -1889,16 +2068,22 @@ func (m *Model) setTableCursorByJobID(jobID string) {
 		if len(row) == 0 {
 			continue
 		}
-		if strings.TrimSpace(row[0]) == jobID {
+		if jobIDFromTableRow(row) == jobID {
 			m.table.SetCursor(i)
 			return
 		}
 	}
 }
 
+func jobIDFromTableRow(row table.Row) string {
+	if len(row) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(row[0])
+}
+
 func (m *Model) updateTable() {
 	if m.loadingJobs {
-		// Keep existing rows while a new job list is being fetched
 		return
 	}
 
@@ -1926,7 +2111,6 @@ func (m *Model) updateTable() {
 	}
 
 	rows := []table.Row{}
-
 	// Helper to truncate strings
 	truncate := func(s string, max int) string {
 		if len(s) > max {
@@ -2079,7 +2263,7 @@ func (m Model) resolveTailPathsCmd(id string, mode TailMode) tea.Cmd {
 }
 
 func main() {
-	p := tea.NewProgram(NewModel(), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(NewModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Alas, there's been an error: %v", err)
 		os.Exit(1)

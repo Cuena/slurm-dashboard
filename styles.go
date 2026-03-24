@@ -4,7 +4,8 @@ import "github.com/charmbracelet/lipgloss"
 
 var (
 	subtle        = theme.TextMuted
-	highlight     = theme.Accent
+	accentFill    = theme.Accent
+	focusBorder   = theme.Focus
 	panelBorder   = theme.Border
 	panelBg       = theme.Surface
 	panelBgAccent = theme.SurfaceAlt
@@ -21,26 +22,40 @@ var (
 
 	// Top section styles
 	metaPillStyle = lipgloss.NewStyle().
-			Foreground(highlight).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(panelBorder).
+			Foreground(textStrong).
+			Background(panelBgAccent).
 			Padding(0, 1).
 			Bold(true).
 			Align(lipgloss.Center)
 
 	metaMutedPillStyle = metaPillStyle.Copy().
 				Foreground(subtle).
-				BorderForeground(panelBorder)
+				Background(panelBg)
 
 	metaAlertPillStyle = metaPillStyle.Copy().
-				Background(accentPink).
+				Background(danger).
 				Foreground(textOnAccent).
-				BorderForeground(accentPink)
+				Bold(true)
+
+	toolbarBrandStyle = metaPillStyle.Copy().
+				Foreground(textOnAccent).
+				Background(accentFill)
+
+	toolbarActiveStyle = metaPillStyle.Copy().
+				Foreground(textOnAccent).
+				Background(accentFill)
+
+	toolbarTabStyle = metaMutedPillStyle.Copy().
+			Background(panelBg)
+
+	toolbarMetaStyle = lipgloss.NewStyle().
+			Foreground(subtle)
+
+	toolbarDividerStyle = toolbarMetaStyle.Copy()
 
 	filterBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(panelBorder).
-			Background(panelBg).
+			Foreground(textStrong).
+			Background(panelBgAccent).
 			Padding(0, 1)
 
 	filterHintStyle = lipgloss.NewStyle().
@@ -48,47 +63,51 @@ var (
 
 	focusTagStyle = lipgloss.NewStyle().
 			Foreground(textOnAccent).
-			Background(highlight).
+			Background(accentFill).
 			Padding(0, 1).
-			Bold(true).
-			MarginLeft(1)
+			Bold(true)
 
 	summaryChipStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(panelBorder).
+				Background(panelBg).
 				Padding(0, 1).
 				Align(lipgloss.Left).
 				MarginRight(1)
 
-	summaryLabelStyle = lipgloss.NewStyle().
-				Foreground(subtle).
-				Bold(true)
+	// Main panels
+	listStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(panelBorder).
+			Background(panelBg).
+			Padding(0, 1)
 
-	summaryValueStyle = lipgloss.NewStyle().
+	detailsStyle = lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(panelBorder).
+			Background(panelBg).
+			Padding(0, 1)
+
+	panelTitleStyle = lipgloss.NewStyle().
+			Foreground(textStrong).
+			Bold(true).
+			MarginBottom(0)
+
+	panelMetaStyle = lipgloss.NewStyle().
+			Foreground(subtle)
+
+	detailSummaryStyle = lipgloss.NewStyle().
+				Background(panelBgAccent).
+				Padding(0, 1).
+				MarginBottom(1)
+
+	detailSummaryLabelStyle = lipgloss.NewStyle().
+				Foreground(subtle)
+
+	detailSummaryValueStyle = lipgloss.NewStyle().
 				Foreground(textStrong).
 				Bold(true)
 
-	// Main panels
-	listStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(panelBorder).
-			Background(panelBgAccent).
-			Padding(1, 2)
-
-	detailsStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(panelBorder).
-			Background(panelBgAccent).
-			Padding(1, 2)
-
-	panelTitleStyle = lipgloss.NewStyle().
-			Foreground(subtle).
-			Bold(true).
-			MarginBottom(1)
-
 	detailInspectorStyle = lipgloss.NewStyle().
-				PaddingTop(1).
-				Background(panelBgAccent)
+				PaddingTop(1)
 
 	copyHintStyle = lipgloss.NewStyle().
 			Foreground(subtle)
@@ -102,7 +121,7 @@ var (
 				Italic(true)
 
 	dialogStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
+			Border(lipgloss.NormalBorder()).
 			BorderForeground(accentPink).
 			Background(panelBg).
 			Padding(2, 4).
@@ -116,10 +135,24 @@ var (
 				Align(lipgloss.Left).
 				Padding(0, 1)
 
+	tableCellStyle = lipgloss.NewStyle().
+			Foreground(textStrong).
+			Padding(0, 1)
+
+	jobsTableSelectedCellStyle = tableCellStyle.Copy().
+					Foreground(textOnAccent).
+					Background(accentFill).
+					Bold(true)
+
+	jobsTableSelectedMutedCellStyle = tableCellStyle.Copy().
+					Foreground(textStrong).
+					Background(selectionBg).
+					Bold(true)
+
 	tableSelectedStyle = lipgloss.NewStyle().
-				Foreground(selectionFg).
-				Background(selectionBg).
-				Padding(0, 1)
+				Foreground(textOnAccent).
+				Background(accentFill).
+				Bold(true)
 
 	statusBadgeStyle = lipgloss.NewStyle().
 				Padding(0, 1).
