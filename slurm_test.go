@@ -125,6 +125,14 @@ func TestParseSubmitLineScriptPathHandlesQuotedFlags(t *testing.T) {
 	}
 }
 
+func TestResolveSubmitLineScriptPathUsesWorkDirForRelativePaths(t *testing.T) {
+	got := resolveSubmitLineScriptPath("sbatch scripts/train.sbatch", "/scratch/run-42")
+	want := "/scratch/run-42/scripts/train.sbatch"
+	if got != want {
+		t.Fatalf("expected resolved script path %q, got %q", want, got)
+	}
+}
+
 func TestReadSbatchDirectives(t *testing.T) {
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "job.sbatch")
@@ -165,6 +173,80 @@ func TestParseSbatchDirectivesHandlesQuotedDirectiveValues(t *testing.T) {
 	}
 	if got.chdir != "/scratch/my project" {
 		t.Fatalf("expected chdir directive to preserve spaces, got %q", got.chdir)
+	}
+}
+
+func TestParseSacctLogInfoPreservesPipesInSubmitLine(t *testing.T) {
+	output := `/work|train|/logs/train-123.out|/logs/train-123.err|sbatch --wrap "python -c 'print(\"a|b\")'"`
+
+	got, ok := parseSacctLogInfo(output)
+	if !ok {
+		t.Fatalf("expected sacct log info to parse")
+	}
+	if got.workDir != "/work" {
+		t.Fatalf("expected workdir /work, got %q", got.workDir)
+	}
+	if got.jobName != "train" {
+		t.Fatalf("expected job name train, got %q", got.jobName)
+	}
+	if got.stdout != "/logs/train-123.out" {
+		t.Fatalf("expected stdout path, got %q", got.stdout)
+	}
+	if got.stderr != "/logs/train-123.err" {
+		t.Fatalf("expected stderr path, got %q", got.stderr)
+	}
+	if got.submitLine != `sbatch --wrap "python -c 'print(\"a|b\")'"` {
+		t.Fatalf("expected submit line to preserve pipes, got %q", got.submitLine)
+	}
+}
+
+func TestResolveSacctLogPathsPrefersDirectStdPaths(t *testing.T) {
+	info := sacctLogInfo{
+		workDir:    "/work",
+		jobName:    "train",
+		stdout:     "/logs/train-123.out",
+		stderr:     "/logs/train-123.err",
+		submitLine: "sbatch train.sbatch",
+	}
+
+	gotOut, gotErr, ok := resolveSacctLogPaths(info, "123")
+	if !ok {
+		t.Fatalf("expected direct sacct paths to resolve")
+	}
+	if gotOut != "/logs/train-123.out" {
+		t.Fatalf("expected stdout path, got %q", gotOut)
+	}
+	if gotErr != "/logs/train-123.err" {
+		t.Fatalf("expected stderr path, got %q", gotErr)
+	}
+}
+
+func TestResolveSacctLogPathsFallsBackToRelativeScriptDirectives(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "scripts", "train.sbatch")
+	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+		t.Fatalf("mkdir scripts dir: %v", err)
+	}
+	contents := "#!/bin/bash\n#SBATCH --output=logs/%x_%j.out\n#SBATCH --error=logs/%x_%j.err\n"
+	if err := os.WriteFile(scriptPath, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	info := sacctLogInfo{
+		workDir:    dir,
+		jobName:    "train",
+		submitLine: "sbatch scripts/train.sbatch",
+	}
+
+	gotOut, gotErr, ok := resolveSacctLogPaths(info, "123")
+	if !ok {
+		t.Fatalf("expected script directives to resolve log paths")
+	}
+	if gotOut != filepath.Join(dir, "logs", "train_123.out") {
+		t.Fatalf("expected stdout path from script directives, got %q", gotOut)
+	}
+	if gotErr != filepath.Join(dir, "logs", "train_123.err") {
+		t.Fatalf("expected stderr path from script directives, got %q", gotErr)
 	}
 }
 

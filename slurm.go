@@ -247,7 +247,8 @@ func GetJobDetails(jobID string, history bool) (string, error) {
 
 // ResolveLogPaths finds StdOut and StdErr paths for a job.
 // For live/running jobs, it uses scontrol which has the exact paths.
-// For finished jobs (or if scontrol fails), it falls back to sacct heuristics.
+// For finished jobs (or if scontrol fails), it prefers direct sacct log fields
+// and only then falls back to submit-line/script heuristics.
 func ResolveLogPaths(jobID string) (string, string, error) {
 	// Try scontrol first (works for jobs still in slurmctld memory)
 	out, err := RunCommand([]string{"scontrol", "show", "job", jobID}, 10*time.Second)
@@ -271,80 +272,15 @@ func ResolveLogPaths(jobID string) (string, string, error) {
 		}
 	}
 
-	// Fallback: Use sacct for finished/historical jobs
-	// NOTE: sacct doesn't provide StdOut/StdErr directly, so we use heuristics:
-	// 1. Parse -o/--output and -e/--error from SubmitLine if present
-	// 2. If SubmitLine references a script, parse #SBATCH directives
-	// 3. Default to WorkDir/slurm-JOBID.out
+	// Fallback: Use sacct for finished/historical jobs.
+	// Prefer the direct StdOut/StdErr fields when available. If they are missing,
+	// fall back to submit-line/script heuristics and finally WorkDir/slurm-JOBID.out.
 	//
-	// Using -X to get only the main job entry (skip .batch, .extern steps which have empty WorkDir)
-	outSacct, errSacct := RunCommand([]string{"sacct", "-j", jobID, "-o", "WorkDir,SubmitLine,JobName", "-X", "-n", "-P"}, 5*time.Second)
+	// Using -X to get only the main job entry (skip .batch, .extern steps).
+	outSacct, errSacct := RunCommand([]string{"sacct", "-j", jobID, "-o", "WorkDir,JobName,StdOut,StdErr,SubmitLine", "-X", "-n", "-P", "--expand-patterns"}, 5*time.Second)
 	if errSacct == nil {
-		lines := strings.Split(strings.TrimSpace(outSacct), "\n")
-		workDir := ""
-		submitLine := ""
-		jobName := ""
-
-		// Find the first line with a non-empty WorkDir
-		// (step entries like .batch/.extern have empty WorkDir)
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-
-			parts := strings.SplitN(line, "|", 3)
-			if len(parts) < 3 {
-				continue
-			}
-
-			wd := strings.TrimSpace(parts[0])
-			if wd == "" {
-				// Skip entries with empty WorkDir (step entries)
-				continue
-			}
-
-			workDir = wd
-			submitLine = strings.TrimSpace(parts[1])
-			jobName = strings.TrimSpace(parts[2])
-			break
-		}
-
-		if workDir != "" {
-			submitDirectives := parseSubmitLineDirectives(submitLine)
-			baseDir := workDir
-			if submitDirectives.chdir != "" {
-				baseDir = submitDirectives.chdir
-			}
-
-			stdoutPath := resolveLogPath(submitDirectives.stdout, baseDir, jobID, jobName)
-			stderrPath := resolveLogPath(submitDirectives.stderr, baseDir, jobID, jobName)
-
-			if stdoutPath == "" || stderrPath == "" {
-				if scriptPath := parseSubmitLineScriptPath(submitLine); scriptPath != "" {
-					if scriptDirectives, err := readSbatchDirectives(scriptPath); err == nil {
-						scriptBase := baseDir
-						if scriptDirectives.chdir != "" {
-							scriptBase = scriptDirectives.chdir
-						}
-						if stdoutPath == "" {
-							stdoutPath = resolveLogPath(scriptDirectives.stdout, scriptBase, jobID, jobName)
-						}
-						if stderrPath == "" {
-							stderrPath = resolveLogPath(scriptDirectives.stderr, scriptBase, jobID, jobName)
-						}
-					}
-				}
-			}
-
-			if stdoutPath == "" {
-				stdoutPath = resolveLogPath(fmt.Sprintf("slurm-%s.out", jobID), workDir, jobID, jobName)
-			}
-			if stderrPath == "" {
-				stderrPath = stdoutPath
-			}
-
-			if stdoutPath != "" || stderrPath != "" {
+		if info, ok := parseSacctLogInfo(outSacct); ok {
+			if stdoutPath, stderrPath, ok := resolveSacctLogPaths(info, jobID); ok {
 				return stdoutPath, stderrPath, nil
 			}
 		}
@@ -357,6 +293,93 @@ func ResolveLogPaths(jobID string) (string, string, error) {
 	}
 
 	return "", "", fmt.Errorf("could not resolve logs (job may be purged from sacct or WorkDir unavailable); also checked archive convention in %s", logArchiveDir())
+}
+
+type sacctLogInfo struct {
+	workDir    string
+	jobName    string
+	stdout     string
+	stderr     string
+	submitLine string
+}
+
+func parseSacctLogInfo(output string) (sacctLogInfo, bool) {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.SplitN(line, "|", 5)
+		if len(parts) < 5 {
+			continue
+		}
+
+		info := sacctLogInfo{
+			workDir:    strings.TrimSpace(parts[0]),
+			jobName:    strings.TrimSpace(parts[1]),
+			stdout:     cleanSbatchValue(parts[2]),
+			stderr:     cleanSbatchValue(parts[3]),
+			submitLine: strings.TrimSpace(parts[4]),
+		}
+		if info.workDir == "" && info.jobName == "" && info.stdout == "" && info.stderr == "" && info.submitLine == "" {
+			continue
+		}
+		return info, true
+	}
+
+	return sacctLogInfo{}, false
+}
+
+func resolveSacctLogPaths(info sacctLogInfo, jobID string) (string, string, bool) {
+	stdoutPath := info.stdout
+	stderrPath := info.stderr
+	if stdoutPath != "" || stderrPath != "" {
+		if stderrPath == "" {
+			stderrPath = stdoutPath
+		}
+		return stdoutPath, stderrPath, true
+	}
+
+	submitDirectives := parseSubmitLineDirectives(info.submitLine)
+	baseDir := info.workDir
+	if submitDirectives.chdir != "" {
+		baseDir = submitDirectives.chdir
+	}
+
+	stdoutPath = resolveLogPath(submitDirectives.stdout, baseDir, jobID, info.jobName)
+	stderrPath = resolveLogPath(submitDirectives.stderr, baseDir, jobID, info.jobName)
+
+	if stdoutPath == "" || stderrPath == "" {
+		if scriptPath := resolveSubmitLineScriptPath(info.submitLine, info.workDir); scriptPath != "" {
+			if scriptDirectives, err := readSbatchDirectives(scriptPath); err == nil {
+				scriptBase := baseDir
+				if scriptDirectives.chdir != "" {
+					scriptBase = scriptDirectives.chdir
+				}
+				if stdoutPath == "" {
+					stdoutPath = resolveLogPath(scriptDirectives.stdout, scriptBase, jobID, info.jobName)
+				}
+				if stderrPath == "" {
+					stderrPath = resolveLogPath(scriptDirectives.stderr, scriptBase, jobID, info.jobName)
+				}
+			}
+		}
+	}
+
+	if stdoutPath == "" && info.workDir != "" {
+		stdoutPath = resolveLogPath(fmt.Sprintf("slurm-%s.out", jobID), info.workDir, jobID, info.jobName)
+	}
+	if stderrPath == "" {
+		stderrPath = stdoutPath
+	}
+
+	if stdoutPath != "" || stderrPath != "" {
+		return stdoutPath, stderrPath, true
+	}
+
+	return "", "", false
 }
 
 var (
@@ -379,6 +402,14 @@ func parseSubmitLineDirectives(submitLine string) sbatchDirectives {
 func parseSubmitLineScriptPath(submitLine string) string {
 	_, scriptPath := parseSbatchTokens(splitSubmitTokens(submitLine))
 	return scriptPath
+}
+
+func resolveSubmitLineScriptPath(submitLine, workDir string) string {
+	scriptPath := parseSubmitLineScriptPath(submitLine)
+	if scriptPath == "" || filepath.IsAbs(scriptPath) || workDir == "" {
+		return scriptPath
+	}
+	return filepath.Join(workDir, scriptPath)
 }
 
 func submitLineFlagTakesValue(flag string) bool {
