@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	osc52 "github.com/aymanbagabas/go-osc52/v2"
 	"github.com/charmbracelet/bubbles/key"
@@ -24,6 +25,7 @@ import (
 // Keeping this reasonably small avoids unbounded memory growth and slow re-renders
 // when viewing very large logs. Increase if you need more history.
 const MaxLogLines = 5000
+const selectionAutoScrollInterval = 35 * time.Millisecond
 
 type TailMode int
 
@@ -111,6 +113,10 @@ type tailStartMsg struct {
 	startErr     error
 }
 
+type selectionAutoScrollMsg struct {
+	session uint64
+}
+
 // TailModel handles the dual-pane log viewing
 type TailModel struct {
 	session    uint64
@@ -119,6 +125,9 @@ type TailModel struct {
 	stderrPath string
 
 	mode TailMode
+
+	stdoutStarted bool
+	stderrStarted bool
 
 	stdoutView viewport.Model
 	stderrView viewport.Model
@@ -176,6 +185,10 @@ type TailModel struct {
 	selectionAnchor selectionPoint
 	selectionCursor selectionPoint
 	selecting       bool
+	selectionMouseX int
+	selectionMouseY int
+
+	selectionAutoScrollPending bool
 
 	styles *TailStyles
 }
@@ -246,6 +259,8 @@ func NewTailModel(jobID, stdoutPath, stderrPath string, width, height int, mode 
 		stdoutPath:    stdoutPath,
 		stderrPath:    stderrPath,
 		mode:          mode,
+		stdoutStarted: mode == TailModeBoth || mode == TailModeStdout,
+		stderrStarted: mode == TailModeBoth || mode == TailModeStderr,
 		stdoutLines:   []string{},
 		stderrLines:   []string{},
 		wrappedStdout: []string{},
@@ -316,6 +331,25 @@ func NewTailModel(jobID, stdoutPath, stderrPath string, width, height int, mode 
 	m.recalculateLayout()
 
 	return m
+}
+
+func (m *TailModel) ensurePaneStarted(pane string) tea.Cmd {
+	switch pane {
+	case "stdout":
+		if m.stdoutStarted {
+			return nil
+		}
+		m.stdoutStarted = true
+		return m.startTailCmd("stdout", m.stdoutPath)
+	case "stderr":
+		if m.stderrStarted {
+			return nil
+		}
+		m.stderrStarted = true
+		return m.startTailCmd("stderr", m.stderrPath)
+	default:
+		return nil
+	}
 }
 
 func (m *TailModel) recalculateLayout() {
@@ -634,7 +668,7 @@ func (m TailModel) paneSelectionPoint(pane string, x, y int, clampToViewport boo
 	}
 
 	inPane := x >= geom.x && x < geom.x+geom.width && y >= geom.y && y < geom.y+geom.height
-	if !inPane {
+	if !inPane && !clampToViewport {
 		return selectionPoint{}, false
 	}
 
@@ -698,6 +732,88 @@ func (m *TailModel) refreshPaneContent(pane string) {
 	case "stderr":
 		m.refreshStderrContent()
 	}
+}
+
+func (m TailModel) selectionAutoScrollDirection(pane string, y int) int {
+	geom, ok := m.paneGeometry(pane)
+	if !ok || geom.contentHeight <= 0 {
+		return 0
+	}
+
+	margin := 1
+	topEdge := geom.contentY + margin
+	bottomEdge := geom.contentY + geom.contentHeight - 1 - margin
+
+	switch {
+	case y < topEdge:
+		return -1
+	case y > bottomEdge:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (m *TailModel) autoScrollSelection(pane string, y int) bool {
+	geom, ok := m.paneGeometry(pane)
+	if !ok || geom.contentHeight <= 0 {
+		return false
+	}
+
+	var vp *viewport.Model
+	switch pane {
+	case "stdout":
+		vp = &m.stdoutView
+	case "stderr":
+		vp = &m.stderrView
+	default:
+		return false
+	}
+
+	lines := m.paneVisualLines(pane)
+	maxOffset := len(lines) - vp.Height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if maxOffset == 0 {
+		return false
+	}
+
+	delta := m.selectionAutoScrollDirection(pane, y)
+	if delta == 0 {
+		return false
+	}
+
+	nextOffset := vp.YOffset + delta
+	if nextOffset < 0 {
+		nextOffset = 0
+	}
+	if nextOffset > maxOffset {
+		nextOffset = maxOffset
+	}
+	if nextOffset == vp.YOffset {
+		return false
+	}
+
+	vp.YOffset = nextOffset
+	return true
+}
+
+func selectionAutoScrollCmd(session uint64) tea.Cmd {
+	return tea.Tick(selectionAutoScrollInterval, func(time.Time) tea.Msg {
+		return selectionAutoScrollMsg{session: session}
+	})
+}
+
+func (m *TailModel) maybeQueueSelectionAutoScroll(cmds []tea.Cmd) []tea.Cmd {
+	if !m.selecting || m.selectionPane == "" || m.selectionAutoScrollPending {
+		return cmds
+	}
+	if m.selectionAutoScrollDirection(m.selectionPane, m.selectionMouseY) == 0 {
+		return cmds
+	}
+	m.selectionAutoScrollPending = true
+	return append(cmds, selectionAutoScrollCmd(m.session))
 }
 
 func isWheelUp(msg tea.MouseMsg) bool {
@@ -949,9 +1065,9 @@ func (m *TailModel) enterCopyMode() tea.Cmd {
 	m.showBorders = false
 	m.recalculateLayout()
 
-	if m.prevMouseEnabled {
-		m.mouseEnabled = false
-		return tea.DisableMouse
+	if !m.prevMouseEnabled {
+		m.mouseEnabled = true
+		return tea.EnableMouseCellMotion
 	}
 	return nil
 }
@@ -968,9 +1084,9 @@ func (m *TailModel) exitCopyMode() tea.Cmd {
 	m.activePane = m.prevActivePane
 	m.recalculateLayout()
 
-	if m.prevMouseEnabled {
-		m.mouseEnabled = true
-		return tea.EnableMouseCellMotion
+	if !m.prevMouseEnabled {
+		m.mouseEnabled = false
+		return tea.DisableMouse
 	}
 	return nil
 }
@@ -1150,6 +1266,7 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, copyCmd)
 			}
 		case key.Matches(msg, tailKeys.ShowStdout):
+			cmds = append(cmds, m.ensurePaneStarted("stdout"))
 			m.mode = TailModeStdout
 			if m.mouseEnabled {
 				m.mouseEnabled = false // Auto-disable mouse for easier copying
@@ -1157,6 +1274,7 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.recalculateLayout()
 		case key.Matches(msg, tailKeys.ShowStderr):
+			cmds = append(cmds, m.ensurePaneStarted("stderr"))
 			m.mode = TailModeStderr
 			if m.mouseEnabled {
 				m.mouseEnabled = false // Auto-disable mouse for easier copying
@@ -1169,6 +1287,8 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, copyCmd)
 				}
 			}
+			cmds = append(cmds, m.ensurePaneStarted("stdout"))
+			cmds = append(cmds, m.ensurePaneStarted("stderr"))
 			m.mode = TailModeBoth
 			m.recalculateLayout()
 		case key.Matches(msg, tailKeys.NextPane):
@@ -1341,19 +1461,26 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selectionAnchor = pt
 			m.selectionCursor = pt
 			m.selecting = true
+			m.selectionMouseX = msg.X
+			m.selectionMouseY = msg.Y
+			m.selectionAutoScrollPending = false
 			m.refreshPaneContent(pane)
 		case leftMotion && m.selecting:
 			if m.selectionPane == "" {
 				break
 			}
+			m.selectionMouseX = msg.X
+			m.selectionMouseY = msg.Y
+			scrolled := m.autoScrollSelection(m.selectionPane, msg.Y)
 			pt, ok := m.paneSelectionPoint(m.selectionPane, msg.X, msg.Y, true)
 			if !ok {
 				break
 			}
-			if pt != m.selectionCursor {
+			if scrolled || pt != m.selectionCursor {
 				m.selectionCursor = pt
 				m.refreshPaneContent(m.selectionPane)
 			}
+			cmds = m.maybeQueueSelectionAutoScroll(cmds)
 		case leftRelease && m.selecting:
 			if m.selectionPane != "" {
 				if pt, ok := m.paneSelectionPoint(m.selectionPane, msg.X, msg.Y, true); ok {
@@ -1362,7 +1489,24 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshPaneContent(m.selectionPane)
 			}
 			m.selecting = false
+			m.selectionAutoScrollPending = false
 		}
+
+	case selectionAutoScrollMsg:
+		if msg.session != m.session {
+			break
+		}
+		m.selectionAutoScrollPending = false
+		if !m.selecting || m.selectionPane == "" {
+			break
+		}
+		scrolled := m.autoScrollSelection(m.selectionPane, m.selectionMouseY)
+		pt, ok := m.paneSelectionPoint(m.selectionPane, m.selectionMouseX, m.selectionMouseY, true)
+		if ok && (scrolled || pt != m.selectionCursor) {
+			m.selectionCursor = pt
+			m.refreshPaneContent(m.selectionPane)
+		}
+		cmds = m.maybeQueueSelectionAutoScroll(cmds)
 
 	case tailStartMsg:
 		if msg.session != m.session {

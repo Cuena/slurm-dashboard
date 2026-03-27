@@ -9,6 +9,27 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+func runTeaCmd(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+
+	msg := cmd()
+	if msg == nil {
+		return nil
+	}
+
+	if batch, ok := msg.(tea.BatchMsg); ok {
+		var msgs []tea.Msg
+		for _, subcmd := range batch {
+			msgs = append(msgs, runTeaCmd(subcmd)...)
+		}
+		return msgs
+	}
+
+	return []tea.Msg{msg}
+}
+
 func TestTailBottomInBothModeAffectsOnlyActivePaneAndDoesNotPageUp(t *testing.T) {
 	m := NewTailModel("1", "", "", 80, 12, TailModeBoth)
 	m.mode = TailModeBoth
@@ -88,6 +109,35 @@ func TestTailSelectedTextAcrossOffscreenRange(t *testing.T) {
 	}
 }
 
+func TestTailCopyModeTemporarilyEnablesMouse(t *testing.T) {
+	m := NewTailModel("1", "", "", 80, 12, TailModeStdout)
+	if m.mouseEnabled {
+		t.Fatalf("expected mouse to start disabled")
+	}
+
+	enterCmd := m.enterCopyMode()
+	if !m.copyMode {
+		t.Fatalf("expected copy mode to be active")
+	}
+	if !m.mouseEnabled {
+		t.Fatalf("expected copy mode to enable mouse for in-app selection")
+	}
+	if enterCmd == nil {
+		t.Fatalf("expected enabling mouse command when entering copy mode from mouse-off state")
+	}
+
+	exitCmd := m.exitCopyMode()
+	if m.copyMode {
+		t.Fatalf("expected copy mode to be cleared")
+	}
+	if m.mouseEnabled {
+		t.Fatalf("expected mouse state to be restored after exiting copy mode")
+	}
+	if exitCmd == nil {
+		t.Fatalf("expected disabling mouse command when restoring mouse-off state")
+	}
+}
+
 func TestTailMouseWheelExtendsSelectionWhileDragging(t *testing.T) {
 	m := NewTailModel("1", "", "", 90, 20, TailModeStdout)
 	for i := 0; i < 120; i++ {
@@ -136,6 +186,119 @@ func TestTailMouseWheelExtendsSelectionWhileDragging(t *testing.T) {
 	}
 }
 
+func TestTailDragSelectionAutoScrollsNearBottomInCopyMode(t *testing.T) {
+	m := NewTailModel("1", "", "", 90, 20, TailModeStdout)
+	for i := 0; i < 160; i++ {
+		m.stdoutLines = append(m.stdoutLines, fmt.Sprintf("line-%03d payload", i))
+	}
+	m.refreshStdoutContent()
+	if cmd := m.enterCopyMode(); cmd == nil {
+		t.Fatalf("expected copy mode to request mouse enable")
+	}
+
+	geom, ok := m.paneGeometry("stdout")
+	if !ok {
+		t.Fatalf("expected stdout geometry")
+	}
+	x := geom.contentX + 1
+	startY := geom.contentY + 1
+
+	model, _ := m.Update(tea.MouseMsg{
+		X:      x,
+		Y:      startY,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		Type:   tea.MouseLeft,
+	})
+	m = model.(TailModel)
+
+	dragY := geom.contentY + geom.contentHeight + 2
+	for i := 0; i < 8; i++ {
+		model, _ = m.Update(tea.MouseMsg{
+			X:      x,
+			Y:      dragY,
+			Action: tea.MouseActionMotion,
+			Button: tea.MouseButtonLeft,
+			Type:   tea.MouseMotion,
+		})
+		m = model.(TailModel)
+	}
+
+	if m.stdoutView.YOffset <= 0 {
+		t.Fatalf("expected drag selection to auto-scroll down, got YOffset=%d", m.stdoutView.YOffset)
+	}
+	if m.selectionCursor.line <= m.selectionAnchor.line {
+		t.Fatalf("expected selection to extend beyond anchor after auto-scroll; anchor=%d cursor=%d", m.selectionAnchor.line, m.selectionCursor.line)
+	}
+
+	selected := m.selectedText()
+	if selected == "" {
+		t.Fatalf("expected non-empty selection after auto-scroll drag")
+	}
+}
+
+func TestTailSelectionAutoScrollTickContinuesWithoutMouseMotion(t *testing.T) {
+	m := NewTailModel("1", "", "", 90, 20, TailModeStdout)
+	for i := 0; i < 220; i++ {
+		m.stdoutLines = append(m.stdoutLines, fmt.Sprintf("line-%03d payload", i))
+	}
+	m.refreshStdoutContent()
+	if cmd := m.enterCopyMode(); cmd == nil {
+		t.Fatalf("expected copy mode to request mouse enable")
+	}
+
+	geom, ok := m.paneGeometry("stdout")
+	if !ok {
+		t.Fatalf("expected stdout geometry")
+	}
+	x := geom.contentX + 1
+	startY := geom.contentY + 1
+
+	model, _ := m.Update(tea.MouseMsg{
+		X:      x,
+		Y:      startY,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		Type:   tea.MouseLeft,
+	})
+	m = model.(TailModel)
+
+	edgeY := geom.contentY + geom.contentHeight + 2
+	model, cmd := m.Update(tea.MouseMsg{
+		X:      x,
+		Y:      edgeY,
+		Action: tea.MouseActionMotion,
+		Button: tea.MouseButtonLeft,
+		Type:   tea.MouseMotion,
+	})
+	m = model.(TailModel)
+
+	if cmd == nil {
+		t.Fatalf("expected initial drag past edge to schedule auto-scroll")
+	}
+	if !m.selectionAutoScrollPending {
+		t.Fatalf("expected auto-scroll to be pending after edge drag")
+	}
+
+	initialOffset := m.stdoutView.YOffset
+	initialCursor := m.selectionCursor.line
+
+	for i := 0; i < 3; i++ {
+		model, cmd = m.Update(selectionAutoScrollMsg{session: m.session})
+		m = model.(TailModel)
+	}
+
+	if m.stdoutView.YOffset <= initialOffset {
+		t.Fatalf("expected timer-driven auto-scroll to continue without more mouse motion, initial=%d final=%d", initialOffset, m.stdoutView.YOffset)
+	}
+	if m.selectionCursor.line <= initialCursor {
+		t.Fatalf("expected selection cursor to continue advancing, initial=%d final=%d", initialCursor, m.selectionCursor.line)
+	}
+	if cmd == nil {
+		t.Fatalf("expected auto-scroll to keep scheduling while cursor stays beyond the edge")
+	}
+}
+
 func TestTailIgnoresStaleSessionMessages(t *testing.T) {
 	stale := NewTailModel("1", "", "", 80, 12, TailModeStdout)
 	current := NewTailModel("1", "", "", 80, 12, TailModeStdout)
@@ -166,5 +329,65 @@ func TestTailIgnoresStaleSessionMessages(t *testing.T) {
 	current = model.(TailModel)
 	if got := strings.Join(current.stdoutLines, "\n"); strings.Contains(got, "EOF (tail exited)") {
 		t.Fatalf("stale EOF should be ignored, got %q", got)
+	}
+}
+
+func TestTailShowBothStartsMissingPaneFromStdoutMode(t *testing.T) {
+	m := NewTailModel("1", "", "", 80, 12, TailModeStdout)
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	updated := model.(TailModel)
+
+	if updated.mode != TailModeBoth {
+		t.Fatalf("expected mode to switch to both, got %v", updated.mode)
+	}
+	if !updated.stdoutStarted {
+		t.Fatalf("expected stdout pane to remain started")
+	}
+	if !updated.stderrStarted {
+		t.Fatalf("expected stderr pane to be marked started after switching to both")
+	}
+
+	msgs := runTeaCmd(cmd)
+	if len(msgs) != 1 {
+		t.Fatalf("expected one start message, got %d", len(msgs))
+	}
+
+	start, ok := msgs[0].(tailStartMsg)
+	if !ok {
+		t.Fatalf("expected tailStartMsg, got %T", msgs[0])
+	}
+	if start.pane != "stderr" {
+		t.Fatalf("expected missing stderr pane to start, got %q", start.pane)
+	}
+}
+
+func TestTailShowStdoutStartsMissingPaneFromStderrMode(t *testing.T) {
+	m := NewTailModel("1", "", "", 80, 12, TailModeStderr)
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	updated := model.(TailModel)
+
+	if updated.mode != TailModeStdout {
+		t.Fatalf("expected mode to switch to stdout, got %v", updated.mode)
+	}
+	if !updated.stdoutStarted {
+		t.Fatalf("expected stdout pane to be marked started after switching to stdout")
+	}
+	if !updated.stderrStarted {
+		t.Fatalf("expected stderr pane to remain started")
+	}
+
+	msgs := runTeaCmd(cmd)
+	if len(msgs) != 1 {
+		t.Fatalf("expected one start message, got %d", len(msgs))
+	}
+
+	start, ok := msgs[0].(tailStartMsg)
+	if !ok {
+		t.Fatalf("expected tailStartMsg, got %T", msgs[0])
+	}
+	if start.pane != "stdout" {
+		t.Fatalf("expected missing stdout pane to start, got %q", start.pane)
 	}
 }
