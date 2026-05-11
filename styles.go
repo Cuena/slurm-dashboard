@@ -2,6 +2,13 @@ package main
 
 import "github.com/charmbracelet/lipgloss"
 
+func panelBorderShape() lipgloss.Border {
+	if theme.Mode == ThemeLight {
+		return lipgloss.ThickBorder()
+	}
+	return lipgloss.RoundedBorder()
+}
+
 var (
 	subtle        = theme.TextMuted
 	accentFill    = theme.Accent
@@ -19,6 +26,15 @@ var (
 	textOnAccent  = theme.TextOnAccent
 	selectionBg   = theme.SelectionBg
 	selectionFg   = theme.SelectionFg
+	helpKeyStyle  = lipgloss.NewStyle().
+			Foreground(textStrong).
+			Bold(true)
+	helpDescStyle = lipgloss.NewStyle().
+			Foreground(theme.TextDim)
+	helpSepStyle = lipgloss.NewStyle().
+			Foreground(panelBorder)
+	helpEllipsisStyle = lipgloss.NewStyle().
+				Foreground(subtle)
 
 	// Top section styles
 	metaPillStyle = lipgloss.NewStyle().
@@ -48,8 +64,7 @@ var (
 	toolbarTabStyle = metaMutedPillStyle.Copy().
 			Background(panelBg)
 
-	toolbarMetaStyle = lipgloss.NewStyle().
-			Foreground(subtle)
+	toolbarMetaStyle = adaptiveToolbarMetaStyle()
 
 	toolbarDividerStyle = toolbarMetaStyle.Copy()
 
@@ -75,13 +90,13 @@ var (
 
 	// Main panels
 	listStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder()).
+			Border(panelBorderShape()).
 			BorderForeground(panelBorder).
 			Background(panelBg).
 			Padding(0, 1)
 
 	detailsStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder()).
+			Border(panelBorderShape()).
 			BorderForeground(panelBorder).
 			Background(panelBg).
 			Padding(0, 1)
@@ -121,7 +136,7 @@ var (
 				Italic(true)
 
 	dialogStyle = lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder()).
+			Border(panelBorderShape()).
 			BorderForeground(accentPink).
 			Background(panelBg).
 			Padding(2, 4).
@@ -148,11 +163,6 @@ var (
 					Foreground(textStrong).
 					Background(selectionBg).
 					Bold(true)
-
-	tableSelectedStyle = lipgloss.NewStyle().
-				Foreground(textOnAccent).
-				Background(accentFill).
-				Bold(true)
 
 	statusBadgeStyle = lipgloss.NewStyle().
 				Padding(0, 1).
@@ -185,4 +195,24 @@ func statusColor(state string) lipgloss.TerminalColor {
 		return c
 	}
 	return theme.TextDim
+}
+
+func adaptiveToolbarMetaStyle() lipgloss.Style {
+	if theme.Mode == ThemeLight {
+		return lipgloss.NewStyle().Foreground(theme.TextDim)
+	}
+	return lipgloss.NewStyle().Foreground(subtle)
+}
+
+func detailSelectedCellStyle(focused bool) lipgloss.Style {
+	if focused {
+		return tableCellStyle.Copy().
+			Foreground(textOnAccent).
+			Background(accentFill).
+			Bold(true)
+	}
+
+	return tableCellStyle.Copy().
+		Foreground(textStrong).
+		Background(panelBgAccent)
 }

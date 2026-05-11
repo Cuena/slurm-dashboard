@@ -214,7 +214,7 @@ type TailStyles struct {
 
 func DefaultTailStyles() *TailStyles {
 	return &TailStyles{
-		Border: lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(theme.Border),
+		Border: lipgloss.NewStyle().Border(panelBorderShape()).BorderForeground(theme.Border),
 		Title:  lipgloss.NewStyle().Foreground(theme.TextStrong).Bold(true),
 	}
 }

@@ -221,7 +221,6 @@ func NewModel() Model {
 	s := table.DefaultStyles()
 	s.Header = tableHeaderStyle
 	s.Cell = tableCellStyle
-	s.Selected = tableSelectedStyle
 	t.SetStyles(s)
 
 	// Details Table setup
@@ -238,7 +237,6 @@ func NewModel() Model {
 	dtStyles := table.DefaultStyles()
 	dtStyles.Header = tableHeaderStyle
 	dtStyles.Cell = tableCellStyle
-	dtStyles.Selected = tableSelectedStyle
 	dt.SetStyles(dtStyles)
 
 	// Input setup
@@ -264,6 +262,17 @@ func NewModel() Model {
 		historyDays:   historyDaysFromEnv(),
 		jobsRequestID: 1,
 	}
+
+	m.help.ShortSeparator = "·"
+	m.help.FullSeparator = "  "
+	m.help.Ellipsis = "…"
+	m.help.Styles.ShortKey = helpKeyStyle
+	m.help.Styles.ShortDesc = helpDescStyle
+	m.help.Styles.ShortSeparator = helpSepStyle
+	m.help.Styles.FullKey = helpKeyStyle
+	m.help.Styles.FullDesc = helpDescStyle
+	m.help.Styles.FullSeparator = helpSepStyle
+	m.help.Styles.Ellipsis = helpEllipsisStyle
 
 	width, height := detectTerminalSize()
 	m.applyWindowSize(width, height)
@@ -1060,7 +1069,7 @@ func (m Model) renderDetailsPanel() string {
 		panelStyle = panelStyle.BorderForeground(focusBorder).Background(panelBg)
 	}
 
-	detailsContent := m.detailsTable.View()
+	detailsContent := m.renderDetailsTable()
 	if strings.TrimSpace(detailsContent) == "" {
 		detailsContent = placeholderStyle.Render("Details will appear here once a job is selected.")
 	}
@@ -1128,12 +1137,107 @@ func (m Model) viewDetailsOverlay() string {
 	})
 	m.detailsTable.SetHeight(bodyH - 3)
 
-	panel := m.detailsBoxStyle().Width(m.width - 2).Render(m.detailsTable.View())
+	panel := m.detailsBoxStyle().Width(m.width - 2).Render(m.renderDetailsTable())
 
 	view := lipgloss.JoinVertical(lipgloss.Left, top, panel, m.help.View(keys))
 	view = clampViewHeight(view, m.height)
 	view = clampViewWidth(view, m.width)
 	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, view)
+}
+
+func (m Model) renderDetailsTable() string {
+	cols := m.detailsTable.Columns()
+	rows := m.detailsTable.Rows()
+	if len(cols) == 0 {
+		return ""
+	}
+
+	headerCells := make([]string, 0, len(cols))
+	for _, col := range cols {
+		if col.Width <= 0 {
+			continue
+		}
+		headerCells = append(headerCells, renderJobsTableCell(col.Title, col.Width, tableHeaderStyle))
+	}
+	header := lipgloss.JoinHorizontal(lipgloss.Top, headerCells...)
+
+	height := m.detailsTable.Height()
+	if height <= 0 {
+		height = len(rows)
+	}
+	if height <= 0 {
+		height = 1
+	}
+
+	cursor := m.detailsTable.Cursor()
+	if cursor < 0 {
+		cursor = 0
+	}
+	if len(rows) > 0 && cursor >= len(rows) {
+		cursor = len(rows) - 1
+	}
+
+	start := 0
+	end := 0
+	if len(rows) > 0 {
+		start = cursor - height/2
+		if start < 0 {
+			start = 0
+		}
+		maxStart := len(rows) - height
+		if maxStart < 0 {
+			maxStart = 0
+		}
+		if start > maxStart {
+			start = maxStart
+		}
+		end = start + height
+		if end > len(rows) {
+			end = len(rows)
+		}
+	}
+
+	rowStyle := tableCellStyle
+	selectedStyle := detailSelectedCellStyle(m.detailsTable.Focused())
+	body := make([]string, 0, height)
+
+	if len(rows) == 0 {
+		body = append(body, placeholderStyle.Render("No details to display."))
+	} else {
+		for rowIdx := start; rowIdx < end; rowIdx++ {
+			row := rows[rowIdx]
+			isSelected := rowIdx == cursor
+			cells := make([]string, 0, len(cols))
+			for colIdx, col := range cols {
+				if col.Width <= 0 {
+					continue
+				}
+				value := ""
+				if colIdx < len(row) {
+					value = row[colIdx]
+				}
+				style := rowStyle
+				if isSelected {
+					style = selectedStyle
+				}
+				cells = append(cells, renderJobsTableCell(value, col.Width, style))
+			}
+			body = append(body, lipgloss.JoinHorizontal(lipgloss.Top, cells...))
+		}
+	}
+
+	for len(body) < height {
+		cells := make([]string, 0, len(cols))
+		for _, col := range cols {
+			if col.Width <= 0 {
+				continue
+			}
+			cells = append(cells, renderJobsTableCell("", col.Width, rowStyle))
+		}
+		body = append(body, lipgloss.JoinHorizontal(lipgloss.Top, cells...))
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, append([]string{header}, body...)...)
 }
 
 func (m *Model) openValueOverlayCmd() tea.Cmd {
