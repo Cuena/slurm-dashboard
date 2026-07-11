@@ -815,7 +815,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) toggleDetailsMode() {
-	if strings.TrimSpace(m.rawDetails) == "" {
+	if strings.TrimSpace(m.rawDetails) == "" || m.appMode == modeHistory {
 		return
 	}
 	m.showAllDetails = !m.showAllDetails
@@ -1130,9 +1130,12 @@ func (m Model) detailsPanelTitle() string {
 	if m.detailsTable.Focused() {
 		parts = append(parts, focusTagStyle.Render("focus"))
 	}
-	modeHint := "a all fields"
-	if m.showAllDetails {
-		modeHint = "a summary"
+	modeHint := "history fields"
+	if m.appMode != modeHistory {
+		modeHint = "a all fields"
+		if m.showAllDetails {
+			modeHint = "a summary"
+		}
 	}
 	parts = append(parts, panelMetaStyle.Render(modeHint))
 	return joinWithGap(parts, 1)
@@ -1340,7 +1343,7 @@ func (m Model) buildDetailInspector() (string, int) {
 	contentWidth := m.detailsContentWidth
 
 	copyMessage := detailInspectorHintText(contentWidth)
-	if contentWidth >= 40 {
+	if contentWidth >= 40 && m.appMode != modeHistory {
 		if m.showAllDetails {
 			copyMessage += "  •  a summary"
 		} else {

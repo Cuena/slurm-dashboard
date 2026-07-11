@@ -163,9 +163,9 @@ func TestToggleDetailsModeRestoresAllRawFields(t *testing.T) {
 	}
 }
 
-func TestSolidSurfacesAreDefault(t *testing.T) {
-	if got := parseSurfaceMode(""); got != SurfaceSolid {
-		t.Fatalf("default surface mode = %q, want solid", got)
+func TestTransparentSurfacesAreDefault(t *testing.T) {
+	if got := parseSurfaceMode(""); got != SurfaceTransparent {
+		t.Fatalf("default surface mode = %q, want transparent", got)
 	}
 }
 

@@ -96,12 +96,12 @@ func parseThemeMode(value string) ThemeMode {
 
 func parseSurfaceMode(value string) SurfaceMode {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "solid", "":
+	case "solid":
 		return SurfaceSolid
-	case "transparent":
+	case "transparent", "":
 		return SurfaceTransparent
 	default:
-		return SurfaceSolid
+		return SurfaceTransparent
 	}
 }
 
