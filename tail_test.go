@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func runTeaCmd(cmd tea.Cmd) []tea.Msg {
@@ -167,6 +168,24 @@ func TestTailCopyModeViewMatchesSelectionGeometry(t *testing.T) {
 	rendered := strings.Split(m.View(), "\n")
 	if geom.contentY >= len(rendered) || !strings.Contains(rendered[geom.contentY], "first-visible-line") {
 		t.Fatalf("selection geometry row %d does not contain the first rendered log line", geom.contentY)
+	}
+}
+
+func TestTailLongPathHeaderStaysOnOneLine(t *testing.T) {
+	m := NewTailModel("1", strings.Repeat("/very-long-directory", 12)+"/job.out", "", 80, 16, TailModeStdout)
+	m.stdoutLines = []string{"first log line"}
+	m.refreshStdoutContent()
+	viewLines := strings.Split(m.View(), "\n")
+	toolbarHeight := lipgloss.Height(m.renderToolbar())
+	geom, ok := m.paneGeometry("stdout")
+	if !ok {
+		t.Fatalf("expected stdout geometry")
+	}
+	if geom.contentY != toolbarHeight+2 {
+		t.Fatalf("expected exactly one header and one border row, toolbar=%d contentY=%d", toolbarHeight, geom.contentY)
+	}
+	if geom.contentY >= len(viewLines) || !strings.Contains(viewLines[geom.contentY], "first log line") {
+		t.Fatalf("long path pushed log content away from expected row")
 	}
 }
 

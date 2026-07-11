@@ -69,6 +69,7 @@ Or:
 - `Tab`: switch focus between jobs and details
 - `Ctrl+y`: copy selected detail value
 - `v`: view full selected detail value
+- `a`: toggle curated/all Slurm detail fields
 - `m`: toggle mouse
 - `?`: expanded help
 
@@ -100,7 +101,7 @@ truncated because many terminals impose OSC52 limits.
 ## Environment Variables
 
 - `SLURM_DASHBOARD_THEME=auto|dark|light`: UI theme selection.
-- `SLURM_DASHBOARD_SURFACES=transparent|solid`: background style (terminal-dependent).
+- `SLURM_DASHBOARD_SURFACES=solid|transparent`: background style (default: `solid`).
 - `SLURM_DASHBOARD_PALETTE=dracula-soft|classic`: color palette.
 - `SLURM_DASHBOARD_HISTORY_DAYS=<positive-integer>` (default: `3`): history window for `sacct` mode.
 - `SLURM_DASHBOARD_LIVE_REFRESH=<duration>` (default: `20s`): `squeue` refresh interval. Plain integers are interpreted as seconds; values below `1s` fall back to the default.

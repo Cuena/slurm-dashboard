@@ -49,9 +49,7 @@ var (
 			Background(panelBg)
 
 	toolbarMetaStyle = lipgloss.NewStyle().
-			Foreground(subtle)
-
-	toolbarDividerStyle = toolbarMetaStyle.Copy()
+				Foreground(subtle)
 
 	filterBoxStyle = lipgloss.NewStyle().
 			Foreground(textStrong).
@@ -66,12 +64,6 @@ var (
 			Background(accentFill).
 			Padding(0, 1).
 			Bold(true)
-
-	summaryChipStyle = lipgloss.NewStyle().
-				Background(panelBg).
-				Padding(0, 1).
-				Align(lipgloss.Left).
-				MarginRight(1)
 
 	// Main panels
 	listStyle = lipgloss.NewStyle().
@@ -140,14 +132,12 @@ var (
 			Padding(0, 1)
 
 	jobsTableSelectedCellStyle = tableCellStyle.Copy().
-					Foreground(textOnAccent).
-					Background(accentFill).
-					Bold(true)
+					Foreground(textStrong).
+					Background(selectionBg)
 
 	jobsTableSelectedMutedCellStyle = tableCellStyle.Copy().
 					Foreground(textStrong).
-					Background(selectionBg).
-					Bold(true)
+					Background(panelBgAccent)
 
 	tableSelectedStyle = lipgloss.NewStyle().
 				Foreground(textOnAccent).

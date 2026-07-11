@@ -96,12 +96,12 @@ func parseThemeMode(value string) ThemeMode {
 
 func parseSurfaceMode(value string) SurfaceMode {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "solid":
+	case "solid", "":
 		return SurfaceSolid
-	case "transparent", "":
+	case "transparent":
 		return SurfaceTransparent
 	default:
-		return SurfaceTransparent
+		return SurfaceSolid
 	}
 }
 
@@ -150,17 +150,17 @@ func newTheme(mode ThemeMode, surfaces SurfaceMode, palette Palette) Theme {
 			Mode:         mode,
 			Surfaces:     surfaces,
 			Text:         lipgloss.NoColor{},
-			TextMuted:    pickColor(mode, "#6B7394", "#B6B8C9"),
+			TextMuted:    pickColor(mode, "#6B7394", "#AEB3C7"),
 			TextStrong:   pickColor(mode, "#0B0D19", "#F8F8F2"),
 			TextOnAccent: lipgloss.Color("#F8FBFF"),
-			TextDim:      pickColor(mode, "#8890A8", "#7D8297"),
+			TextDim:      pickColor(mode, "#8890A8", "#9298AD"),
 
 			Accent: lipgloss.Color("#2d4487"),
 			Focus:  lipgloss.Color("#779ef1"),
-			Border: pickColor(mode, "#B9C9E9", "#495A7D"),
+			Border: pickColor(mode, "#B9C9E9", "#3F4C68"),
 
-			Surface:    pickSurface(mode, surfaces, "#F7F8FE", "#222633"),
-			SurfaceAlt: pickSurface(mode, surfaces, "#FFFFFF", "#2B3140"),
+			Surface:    pickSurface(mode, surfaces, "#F7F8FE", "#171A24"),
+			SurfaceAlt: pickSurface(mode, surfaces, "#FFFFFF", "#222735"),
 
 			AccentPink:   lipgloss.Color("#FF79C6"),
 			AccentCyan:   lipgloss.Color("#8BE9FD"),

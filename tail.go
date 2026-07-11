@@ -20,6 +20,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 	"github.com/muesli/reflow/wordwrap"
 )
 
@@ -67,7 +68,7 @@ type TailKeyMap struct {
 }
 
 func (k TailKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Quit, k.ShowStdout, k.ShowStderr, k.ShowBoth, k.Follow, k.Search, k.FindNext, k.FindPrev, k.CopySelection, k.CopyAll, k.ToggleHelp}
+	return []key.Binding{k.Quit, k.Follow, k.Search, k.CopyMode, k.ToggleHelp}
 }
 
 func (k TailKeyMap) FullHelp() [][]key.Binding {
@@ -234,6 +235,26 @@ func DefaultTailStyles() *TailStyles {
 
 func (m TailModel) InSearchMode() bool {
 	return m.inSearchMode
+}
+
+func (m TailModel) InCopyMode() bool {
+	return m.copyMode
+}
+
+func (m TailModel) CopyFooterView() string {
+	message := "SELECT  drag to extend  •  wheel to scroll  •  Ctrl+y copy  •  y exit"
+	if m.copyFeedback != "" {
+		message = m.copyFeedback + "  •  y exit"
+	}
+	width := m.width
+	if width < 1 {
+		width = 1
+	}
+	return lipgloss.NewStyle().
+		Foreground(textStrong).
+		Background(panelBgAccent).
+		Width(width).
+		Render(message)
 }
 
 // Helper for hidden border
@@ -1905,24 +1926,9 @@ func (m TailModel) View() string {
 		}
 		label := prefix + name
 
-		maxWidth := vp.Width
+		maxWidth := vp.Width + 2
 		if maxWidth < 20 {
 			maxWidth = 20
-		}
-
-		fixedLen := lipgloss.Width(fmt.Sprintf("%s %s", label, scroll))
-
-		available := maxWidth - fixedLen
-
-		displayPath := path
-		if available < 3 {
-			displayPath = ""
-		} else if lipgloss.Width(path) > available {
-			r := []rune(path)
-			trim := len(r) - available + 1
-			if trim > 0 && trim < len(r) {
-				displayPath = "…" + string(r[trim:])
-			}
 		}
 
 		headerStyle := m.styles.Title.Copy()
@@ -1930,15 +1936,23 @@ func (m TailModel) View() string {
 			headerStyle = headerStyle.Foreground(theme.TextDim)
 		}
 
-		parts := []string{
-			headerStyle.Render(label),
-			placeholderStyle.Render(displayPath),
-			metaMutedPillStyle.Render(scroll),
-		}
+		left := headerStyle.Render(label)
+		rightLabel := strings.ToUpper(scroll)
 		if m.hasSelectionInPane(pane) {
-			parts = append(parts, metaMutedPillStyle.Render("sel"))
+			rightLabel += " · SEL"
 		}
-		return wrapSegments(parts, maxWidth, 1)
+		right := panelMetaStyle.Copy().Bold(true).Render(rightLabel)
+		available := maxWidth - lipgloss.Width(left) - lipgloss.Width(right) - 2
+		if available < 0 {
+			available = 0
+		}
+		displayPath := truncateLeftToWidth(path, available)
+		pathField := lipgloss.NewStyle().
+			Foreground(subtle).
+			Width(available).
+			MaxWidth(available).
+			Render(displayPath)
+		return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", pathField, " ", right)
 	}
 
 	wrapIfSearch := func(content string) string {
@@ -2010,32 +2024,34 @@ func (m TailModel) renderToolbar() string {
 	} else if m.following {
 		status = append(status, metaMutedPillStyle.Render("follow"))
 	}
-	if m.mode == TailModeBoth {
-		layout := "columns"
-		if m.stacked {
-			layout = "stack"
-		}
-		status = append(status, metaMutedPillStyle.Render(layout))
-		focusPane := "stdout"
-		if m.activePane == 1 {
-			focusPane = "stderr"
-		}
-		status = append(status, metaMutedPillStyle.Render("focus "+focusPane))
-	}
 	if m.mouseEnabled {
 		status = append(status, metaMutedPillStyle.Render("mouse"))
 	}
 	if m.copyMode {
-		status = append(status, metaMutedPillStyle.Render("select: drag, ^y copy, y exit"))
-	}
-	if m.copyFeedback != "" {
-		status = append(status, metaMutedPillStyle.Render(m.copyFeedback))
+		status = append(status, metaPillStyle.Copy().Background(accentBlue).Foreground(textOnAccent).Render("select"))
 	}
 	if m.inSearchMode {
 		status = append(status, metaMutedPillStyle.Render("search"))
 	}
 
 	return wrapSegments(status, m.width, 1)
+}
+
+func truncateLeftToWidth(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if runewidth.StringWidth(value) <= width {
+		return value
+	}
+	runes := []rune(value)
+	for len(runes) > 0 && runewidth.StringWidth("…"+string(runes)) > width {
+		runes = runes[1:]
+	}
+	if len(runes) == 0 {
+		return runewidth.Truncate("…", width, "")
+	}
+	return "…" + string(runes)
 }
 
 func (m TailModel) renderSearchOverlay(content string) string {
