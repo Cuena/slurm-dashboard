@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -22,14 +24,19 @@ import (
 )
 
 const (
-	refreshInterval      = 5 * time.Second
-	panelGap             = 2 // Slightly smaller gap looks cleaner
-	defaultHistoryDays   = 3
-	envHistoryDays       = "SLURM_DASHBOARD_HISTORY_DAYS"
-	panelChromeWidth     = 8
-	minTablePanelWidth   = 30
-	minDetailsPanelWidth = 20
-	maxDetailsPanelWidth = 50
+	defaultLiveRefresh     = 20 * time.Second
+	defaultHistoryRefresh  = 2 * time.Minute
+	defaultDetailsDebounce = 300 * time.Millisecond
+	panelGap               = 2 // Slightly smaller gap looks cleaner
+	defaultHistoryDays     = 3
+	envHistoryDays         = "SLURM_DASHBOARD_HISTORY_DAYS"
+	envLiveRefresh         = "SLURM_DASHBOARD_LIVE_REFRESH"
+	envHistoryRefresh      = "SLURM_DASHBOARD_HISTORY_REFRESH"
+	envDetailsDebounce     = "SLURM_DASHBOARD_DETAILS_DEBOUNCE"
+	panelChromeWidth       = 8
+	minTablePanelWidth     = 30
+	minDetailsPanelWidth   = 20
+	maxDetailsPanelWidth   = 50
 )
 
 type mode int
@@ -120,6 +127,11 @@ type jobsMsg struct {
 	mode      mode
 	jobs      []Job
 }
+type jobsErrMsg struct {
+	requestID int
+	mode      mode
+	err       error
+}
 type detailsMsg struct {
 	requestID int
 	jobID     string
@@ -129,10 +141,16 @@ type detailsMsg struct {
 type errMsg error
 type refreshNowMsg struct{}
 type tailPathsMsg struct {
+	requestID      int
 	jobID          string
 	stdout, stderr string
 	mode           TailMode
 	err            error
+}
+type detailsDebounceMsg struct {
+	requestID int
+	jobID     string
+	history   bool
 }
 
 // Model is the main application model
@@ -162,11 +180,14 @@ type Model struct {
 	confirmingCancel bool
 	cancelCandidate  *Job
 
-	appMode     mode
-	paused      bool
-	sFilter     statusFilter
-	loadingJobs bool
-	historyDays int
+	appMode         mode
+	paused          bool
+	sFilter         statusFilter
+	loadingJobs     bool
+	historyDays     int
+	liveRefresh     time.Duration
+	historyRefresh  time.Duration
+	detailsDebounce time.Duration
 
 	width  int
 	height int
@@ -196,8 +217,12 @@ type Model struct {
 	copyFeedback       string
 	copyFeedbackExpiry time.Time
 
-	jobsRequestID    int
-	detailsRequestID int
+	jobsRequestID      int
+	detailsRequestID   int
+	tailPathsRequestID int
+	jobsCancel         context.CancelFunc
+	detailsCancel      context.CancelFunc
+	tailPathsCancel    context.CancelFunc
 }
 
 func NewModel() Model {
@@ -253,16 +278,19 @@ func NewModel() Model {
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(focusBorder)
 
 	m := Model{
-		table:         t,
-		detailsTable:  dt,
-		filterInput:   ti,
-		help:          help.New(),
-		appMode:       modeLive,
-		sFilter:       filterAll,
-		fullColumns:   columns,
-		mouseEnabled:  false,
-		historyDays:   historyDaysFromEnv(),
-		jobsRequestID: 1,
+		table:           t,
+		detailsTable:    dt,
+		filterInput:     ti,
+		help:            help.New(),
+		appMode:         modeLive,
+		sFilter:         filterAll,
+		fullColumns:     columns,
+		mouseEnabled:    false,
+		historyDays:     historyDaysFromEnv(),
+		liveRefresh:     durationFromEnv(envLiveRefresh, defaultLiveRefresh, time.Second),
+		historyRefresh:  durationFromEnv(envHistoryRefresh, defaultHistoryRefresh, 5*time.Second),
+		detailsDebounce: durationFromEnv(envDetailsDebounce, defaultDetailsDebounce, 0),
+		jobsRequestID:   1,
 	}
 
 	width, height := detectTerminalSize()
@@ -273,7 +301,7 @@ func NewModel() Model {
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
-		m.fetchJobsCmd(),
+		m.fetchJobsCmd(context.Background()),
 		m.tickCmd(),
 		initialWindowSizeCmd(),
 	)
@@ -533,6 +561,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.jobs = msg.jobs
 		m.lastRefresh = time.Now()
 		m.loadingJobs = false
+		m.err = nil
 		m.updateTable()
 
 		// Sync selection immediately
@@ -559,7 +588,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rawDetails = msg.text
 		m.updateDetailsTable(m.rawDetails)
 
+	case detailsDebounceMsg:
+		if msg.requestID != m.detailsRequestID || msg.jobID != m.selectedID || msg.history != (m.appMode == modeHistory) {
+			break
+		}
+		cmds = append(cmds, m.startDetailsFetchCmd(msg.jobID, msg.requestID, msg.history))
+
 	case tailPathsMsg:
+		if msg.requestID != m.tailPathsRequestID {
+			break
+		}
 		// Use the job ID associated with the request; selection may have
 		// changed while paths were resolving.
 		if msg.jobID != "" {
@@ -574,6 +612,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tailModel.mouseEnabled = m.mouseEnabled // Sync state
 		m.inTailView = true
 		cmds = append(cmds, m.tailModel.Init())
+
+	case jobsErrMsg:
+		if msg.requestID != m.jobsRequestID || msg.mode != m.appMode || errors.Is(msg.err, context.Canceled) {
+			break
+		}
+		m.loadingJobs = false
+		m.err = msg.err
 
 	case errMsg:
 		m.err = msg
@@ -680,19 +725,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Provide feedback in details table immediately
 					m.detailsTable.SetRows([]table.Row{{"Status", "Resolving logs..."}})
 					// Trigger the command
-					cmds = append(cmds, m.resolveTailPathsCmd(job.JobID, TailModeBoth))
+					cmds = append(cmds, m.queueTailPathsCmd(job.JobID, TailModeBoth))
 				}
 			case key.Matches(msg, keys.TailStdout):
 				job := m.getSelectedJob()
 				if job != nil {
 					m.detailsTable.SetRows([]table.Row{{"Status", "Resolving stdout..."}})
-					cmds = append(cmds, m.resolveTailPathsCmd(job.JobID, TailModeStdout))
+					cmds = append(cmds, m.queueTailPathsCmd(job.JobID, TailModeStdout))
 				}
 			case key.Matches(msg, keys.TailStderr):
 				job := m.getSelectedJob()
 				if job != nil {
 					m.detailsTable.SetRows([]table.Row{{"Status", "Resolving stderr..."}})
-					cmds = append(cmds, m.resolveTailPathsCmd(job.JobID, TailModeStderr))
+					cmds = append(cmds, m.queueTailPathsCmd(job.JobID, TailModeStderr))
 				}
 			case key.Matches(msg, keys.SwitchFocus):
 				if m.hideDetails {
@@ -2156,7 +2201,14 @@ func (m *Model) updateTable() {
 // --- Commands ---
 
 func (m Model) tickCmd() tea.Cmd {
-	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg {
+	interval := m.liveRefresh
+	if m.appMode == modeHistory {
+		interval = m.historyRefresh
+	}
+	if interval <= 0 {
+		interval = defaultLiveRefresh
+	}
+	return tea.Tick(interval, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
@@ -2189,31 +2241,48 @@ func historyDaysFromEnv() int {
 	return days
 }
 
-func (m Model) fetchJobsCmd() tea.Cmd {
+func durationFromEnv(name string, fallback, minimum time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		seconds, parseErr := strconv.Atoi(raw)
+		if parseErr != nil {
+			return fallback
+		}
+		value = time.Duration(seconds) * time.Second
+	}
+	if value < minimum {
+		return fallback
+	}
+	return value
+}
+
+func (m Model) fetchJobsCmd(ctx context.Context) tea.Cmd {
 	requestID := m.jobsRequestID
 	requestMode := m.appMode
 	historyDays := m.historyDays
 	return func() tea.Msg {
 		if requestMode == modeHistory {
-			jobs, err := FetchJobsHistory(historyDays)
+			jobs, err := FetchJobsHistoryContext(ctx, historyDays)
 			if err != nil {
-				return errMsg(err)
+				return jobsErrMsg{requestID: requestID, mode: requestMode, err: err}
 			}
 			return jobsMsg{requestID: requestID, mode: requestMode, jobs: jobs}
 		}
-		jobs, err := FetchJobsSqueue()
+		jobs, err := FetchJobsSqueueContext(ctx)
 		if err != nil {
-			return errMsg(err)
+			return jobsErrMsg{requestID: requestID, mode: requestMode, err: err}
 		}
 		return jobsMsg{requestID: requestID, mode: requestMode, jobs: jobs}
 	}
 }
 
-func (m Model) fetchDetailsCmd(id string) tea.Cmd {
-	requestID := m.detailsRequestID
-	history := m.appMode == modeHistory
+func (m Model) fetchDetailsCmd(ctx context.Context, id string, requestID int, history bool) tea.Cmd {
 	return func() tea.Msg {
-		det, err := GetJobDetails(id, history)
+		det, err := GetJobDetailsContext(ctx, id, history)
 		if err != nil {
 			return detailsMsg{
 				requestID: requestID,
@@ -2227,13 +2296,38 @@ func (m Model) fetchDetailsCmd(id string) tea.Cmd {
 }
 
 func (m *Model) queueJobsFetchCmd() tea.Cmd {
+	if m.jobsCancel != nil {
+		m.jobsCancel()
+	}
 	m.jobsRequestID++
-	return m.fetchJobsCmd()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.jobsCancel = cancel
+	return m.fetchJobsCmd(ctx)
 }
 
 func (m *Model) queueDetailsFetchCmd(id string) tea.Cmd {
+	if m.detailsCancel != nil {
+		m.detailsCancel()
+		m.detailsCancel = nil
+	}
 	m.detailsRequestID++
-	return m.fetchDetailsCmd(id)
+	requestID := m.detailsRequestID
+	history := m.appMode == modeHistory
+	if m.detailsDebounce <= 0 {
+		return m.startDetailsFetchCmd(id, requestID, history)
+	}
+	return tea.Tick(m.detailsDebounce, func(time.Time) tea.Msg {
+		return detailsDebounceMsg{requestID: requestID, jobID: id, history: history}
+	})
+}
+
+func (m *Model) startDetailsFetchCmd(id string, requestID int, history bool) tea.Cmd {
+	if m.detailsCancel != nil {
+		m.detailsCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.detailsCancel = cancel
+	return m.fetchDetailsCmd(ctx, id, requestID, history)
 }
 
 func (m Model) cancelJobCmd(id string) tea.Cmd {
@@ -2246,20 +2340,30 @@ func (m Model) cancelJobCmd(id string) tea.Cmd {
 	}
 }
 
-func (m Model) resolveTailPathsCmd(id string, mode TailMode) tea.Cmd {
+func (m Model) resolveTailPathsCmd(ctx context.Context, id string, mode TailMode, requestID int) tea.Cmd {
 	return func() tea.Msg {
-		out, errPath, errExec := ResolveLogPaths(id)
+		out, errPath, errExec := ResolveLogPathsContext(ctx, id)
 
 		// If resolution failed entirely, return empty paths
 		// The tail view will show "No path provided" for empty paths
 		if errExec != nil {
 			// Return empty paths - the tail view handles this gracefully. We
 			// also propagate the error so the header can show it.
-			return tailPathsMsg{jobID: id, stdout: "", stderr: "", mode: mode, err: errExec}
+			return tailPathsMsg{requestID: requestID, jobID: id, stdout: "", stderr: "", mode: mode, err: errExec}
 		}
 
-		return tailPathsMsg{jobID: id, stdout: out, stderr: errPath, mode: mode}
+		return tailPathsMsg{requestID: requestID, jobID: id, stdout: out, stderr: errPath, mode: mode}
 	}
+}
+
+func (m *Model) queueTailPathsCmd(id string, mode TailMode) tea.Cmd {
+	if m.tailPathsCancel != nil {
+		m.tailPathsCancel()
+	}
+	m.tailPathsRequestID++
+	ctx, cancel := context.WithCancel(context.Background())
+	m.tailPathsCancel = cancel
+	return m.resolveTailPathsCmd(ctx, id, mode, m.tailPathsRequestID)
 }
 
 func main() {

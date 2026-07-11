@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	osc52 "github.com/aymanbagabas/go-osc52/v2"
 	"github.com/charmbracelet/bubbles/key"
@@ -21,10 +23,14 @@ import (
 	"github.com/muesli/reflow/wordwrap"
 )
 
-// MaxLogLines caps the number of log lines kept in memory per pane.
+// defaultMaxLogLines caps the number of log lines kept in memory per pane.
 // Keeping this reasonably small avoids unbounded memory growth and slow re-renders
-// when viewing very large logs. Increase if you need more history.
-const MaxLogLines = 5000
+// when viewing very large logs. It can be overridden for long-log workflows.
+const defaultMaxLogLines = 20000
+const envMaxLogLines = "SLURM_DASHBOARD_MAX_LOG_LINES"
+const maxOSC52Bytes = 100 * 1024
+const maxLogReadBatch = 256
+const logReadBatchInterval = 50 * time.Millisecond
 const selectionAutoScrollInterval = 35 * time.Millisecond
 
 type TailMode int
@@ -99,6 +105,7 @@ type logLineMsg struct {
 	session  uint64
 	pane     string // "stdout" or "stderr"
 	line     string
+	lines    []string
 	err      error
 	terminal bool
 }
@@ -115,6 +122,10 @@ type tailStartMsg struct {
 
 type selectionAutoScrollMsg struct {
 	session uint64
+}
+
+type pagerFinishedMsg struct {
+	err error
 }
 
 // TailModel handles the dual-pane log viewing
@@ -189,6 +200,8 @@ type TailModel struct {
 	selectionMouseY int
 
 	selectionAutoScrollPending bool
+	maxLogLines                int
+	copyFeedback               string
 
 	styles *TailStyles
 }
@@ -271,6 +284,7 @@ func NewTailModel(jobID, stdoutPath, stderrPath string, width, height int, mode 
 		height:        height,
 		following:     true,
 		showBorders:   true,
+		maxLogLines:   logLineLimitFromEnv(),
 		styles:        DefaultTailStyles(),
 	}
 
@@ -331,6 +345,18 @@ func NewTailModel(jobID, stdoutPath, stderrPath string, width, height int, mode 
 	m.recalculateLayout()
 
 	return m
+}
+
+func logLineLimitFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv(envMaxLogLines))
+	if raw == "" {
+		return defaultMaxLogLines
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 1000 {
+		return defaultMaxLogLines
+	}
+	return limit
 }
 
 func (m *TailModel) ensurePaneStarted(pane string) tea.Cmd {
@@ -457,36 +483,46 @@ func cleanLogLine(line string) string {
 }
 
 func (m *TailModel) appendLogLine(pane string, lines *[]string, wrapped *[]string, b *strings.Builder, view *viewport.Model, text string) {
-	cleanLine := cleanLogLine(text)
-	*lines = append(*lines, cleanLine)
-	if MaxLogLines > 0 && len(*lines) > MaxLogLines {
-		*lines = (*lines)[1:]
+	m.appendLogLines(pane, lines, wrapped, b, view, []string{text})
+}
+
+func (m *TailModel) appendLogLines(pane string, lines *[]string, wrapped *[]string, b *strings.Builder, view *viewport.Model, texts []string) {
+	if len(texts) == 0 {
+		return
 	}
-
-	wrappedLine := m.wrapLine(cleanLine, view.Width)
-	*wrapped = append(*wrapped, wrappedLine)
-
+	stickToBottom := m.following && !m.paused && view.AtBottom()
 	visualLinesRemoved := 0
 	trimmedWrapped := false
-	if MaxLogLines > 0 && len(*wrapped) > MaxLogLines {
-		removedBlock := (*wrapped)[0]
-		visualLinesRemoved = visualLineCount(removedBlock)
-		*wrapped = (*wrapped)[1:]
+	newWrapped := make([]string, 0, len(texts))
+	for _, text := range texts {
+		cleanLine := cleanLogLine(text)
+		*lines = append(*lines, cleanLine)
+		wrappedLine := m.wrapLine(cleanLine, view.Width)
+		*wrapped = append(*wrapped, wrappedLine)
+		newWrapped = append(newWrapped, wrappedLine)
+	}
+	if m.maxLogLines > 0 && len(*lines) > m.maxLogLines {
+		*lines = (*lines)[len(*lines)-m.maxLogLines:]
+	}
+	if m.maxLogLines > 0 && len(*wrapped) > m.maxLogLines {
+		removeCount := len(*wrapped) - m.maxLogLines
+		for _, removedBlock := range (*wrapped)[:removeCount] {
+			visualLinesRemoved += visualLineCount(removedBlock)
+		}
+		*wrapped = (*wrapped)[removeCount:]
 		trimmedWrapped = true
 	}
 	m.adjustSelectionAfterTrim(pane, visualLinesRemoved)
-
-	stickToBottom := m.following && !m.paused && view.AtBottom()
-
 	needle := strings.ToLower(m.activeSearchTerm())
 	if trimmedWrapped {
-		// Can't efficiently remove from the front; rebuild.
 		m.rebuildPaneContent(pane, b, *wrapped, needle)
 	} else {
-		if b.Len() > 0 {
-			b.WriteByte('\n')
+		for _, wrappedLine := range newWrapped {
+			if b.Len() > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(renderLineForSearch(wrappedLine, needle))
 		}
-		b.WriteString(renderLineForSearch(wrappedLine, needle))
 	}
 	view.SetContent(b.String())
 
@@ -548,6 +584,22 @@ func flattenWrappedLines(wrapped []string) []string {
 	return lines
 }
 
+func flattenWrappedLinesWithBreaks(wrapped []string) ([]string, []bool) {
+	if len(wrapped) == 0 {
+		return nil, nil
+	}
+	lines := make([]string, 0, len(wrapped))
+	hardBreakBefore := make([]bool, 0, len(wrapped))
+	for blockIndex, block := range wrapped {
+		parts := strings.Split(block, "\n")
+		for partIndex, part := range parts {
+			lines = append(lines, part)
+			hardBreakBefore = append(hardBreakBefore, blockIndex > 0 && partIndex == 0)
+		}
+	}
+	return lines, hardBreakBefore
+}
+
 func visualLineCount(block string) int {
 	return strings.Count(block, "\n") + 1
 }
@@ -570,14 +622,30 @@ func runeSlice(s string, start, end int) string {
 	return string(r[start:end])
 }
 
+func limitUTF8Bytes(text string, limit int) (string, bool) {
+	if limit <= 0 || len(text) <= limit {
+		return text, false
+	}
+	cut := limit
+	for cut > 0 && !utf8.ValidString(text[:cut]) {
+		cut--
+	}
+	return text[:cut], true
+}
+
 func (m TailModel) paneVisualLines(pane string) []string {
+	lines, _ := m.paneVisualLinesAndBreaks(pane)
+	return lines
+}
+
+func (m TailModel) paneVisualLinesAndBreaks(pane string) ([]string, []bool) {
 	switch pane {
 	case "stdout":
-		return flattenWrappedLines(m.wrappedStdout)
+		return flattenWrappedLinesWithBreaks(m.wrappedStdout)
 	case "stderr":
-		return flattenWrappedLines(m.wrappedStderr)
+		return flattenWrappedLinesWithBreaks(m.wrappedStderr)
 	default:
-		return nil
+		return nil, nil
 	}
 }
 
@@ -585,6 +653,7 @@ func (m TailModel) paneGeometry(pane string) (paneGeometry, bool) {
 	headerHeight := 1
 	borderX := 2
 	borderY := 2
+	toolbarHeight := lipgloss.Height(m.renderToolbar())
 
 	makeGeom := func(x, y, vpWidth, vpHeight int) paneGeometry {
 		return paneGeometry{
@@ -604,17 +673,17 @@ func (m TailModel) paneGeometry(pane string) (paneGeometry, bool) {
 		if pane != "stdout" {
 			return paneGeometry{}, false
 		}
-		return makeGeom(0, 0, m.stdoutView.Width, m.stdoutView.Height), true
+		return makeGeom(0, toolbarHeight, m.stdoutView.Width, m.stdoutView.Height), true
 	case TailModeStderr:
 		if pane != "stderr" {
 			return paneGeometry{}, false
 		}
-		return makeGeom(0, 0, m.stderrView.Width, m.stderrView.Height), true
+		return makeGeom(0, toolbarHeight, m.stderrView.Width, m.stderrView.Height), true
 	default:
-		stdoutGeom := makeGeom(0, 0, m.stdoutView.Width, m.stdoutView.Height)
-		stderrGeom := makeGeom(0, 0, m.stderrView.Width, m.stderrView.Height)
+		stdoutGeom := makeGeom(0, toolbarHeight, m.stdoutView.Width, m.stdoutView.Height)
+		stderrGeom := makeGeom(0, toolbarHeight, m.stderrView.Width, m.stderrView.Height)
 		if m.stacked {
-			stderrGeom.y = stdoutGeom.height
+			stderrGeom.y = stdoutGeom.y + stdoutGeom.height
 			stderrGeom.contentY = stderrGeom.y + headerHeight + 1
 		} else {
 			stderrGeom.x = stdoutGeom.width
@@ -834,6 +903,56 @@ func isWheelMouse(msg tea.MouseMsg) bool {
 		msg.Type == tea.MouseWheelRight
 }
 
+func (m *TailModel) extendSelectionAfterWheel(pane string, previousOffset, x, y int) bool {
+	if !m.selecting || m.selectionPane != pane {
+		return false
+	}
+
+	var currentOffset int
+	switch pane {
+	case "stdout":
+		currentOffset = m.stdoutView.YOffset
+	case "stderr":
+		currentOffset = m.stderrView.YOffset
+	default:
+		return false
+	}
+
+	delta := currentOffset - previousOffset
+	if delta == 0 {
+		return false
+	}
+
+	lines := m.paneVisualLines(pane)
+	if len(lines) == 0 {
+		return false
+	}
+	start, end := normalizeSelection(m.selectionAnchor, m.selectionCursor)
+	point, ok := m.paneSelectionPoint(pane, x, y, true)
+	if !ok {
+		return false
+	}
+
+	if delta < 0 {
+		start.line += delta
+		if start.line < 0 {
+			start.line = 0
+		}
+		start.col = point.col
+		m.selectionAnchor = end
+		m.selectionCursor = start
+	} else {
+		end.line += delta
+		if end.line >= len(lines) {
+			end.line = len(lines) - 1
+		}
+		end.col = point.col
+		m.selectionAnchor = start
+		m.selectionCursor = end
+	}
+	return true
+}
+
 func (m *TailModel) adjustSelectionAfterTrim(pane string, removedVisualLines int) {
 	if removedVisualLines <= 0 || m.selectionPane != pane {
 		return
@@ -896,7 +1015,7 @@ func (m TailModel) selectedText() string {
 	if m.selectionPane == "" {
 		return ""
 	}
-	lines := m.paneVisualLines(m.selectionPane)
+	lines, hardBreakBefore := m.paneVisualLinesAndBreaks(m.selectionPane)
 	if len(lines) == 0 {
 		return ""
 	}
@@ -942,7 +1061,7 @@ func (m TailModel) selectedText() string {
 		}
 
 		b.WriteString(runeSlice(line, selStart, selEnd))
-		if i < end.line {
+		if i < end.line && i+1 < len(hardBreakBefore) && hardBreakBefore[i+1] {
 			b.WriteByte('\n')
 		}
 	}
@@ -1100,7 +1219,7 @@ func (m *TailModel) openInPagerCmd(path string) tea.Cmd {
 	var cmd *exec.Cmd
 
 	if pager != "" {
-		fields := strings.Fields(pager)
+		fields := splitShellWords(pager)
 		if len(fields) > 0 {
 			bin := fields[0]
 			args := []string{}
@@ -1113,10 +1232,16 @@ func (m *TailModel) openInPagerCmd(path string) tea.Cmd {
 	}
 
 	if cmd == nil {
-		cmd = exec.Command("vim", "-R", path)
+		if lessPath, err := exec.LookPath("less"); err == nil {
+			cmd = exec.Command(lessPath, "-R", "+G", path)
+		} else {
+			cmd = exec.Command("vim", "-R", path)
+		}
 	}
 
-	return tea.ExecProcess(cmd, nil)
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return pagerFinishedMsg{err: err}
+	})
 }
 
 func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1266,6 +1391,11 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, copyCmd)
 			}
 		case key.Matches(msg, tailKeys.ShowStdout):
+			if m.copyMode {
+				if copyCmd := m.exitCopyMode(); copyCmd != nil {
+					cmds = append(cmds, copyCmd)
+				}
+			}
 			cmds = append(cmds, m.ensurePaneStarted("stdout"))
 			m.mode = TailModeStdout
 			if m.mouseEnabled {
@@ -1274,6 +1404,11 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.recalculateLayout()
 		case key.Matches(msg, tailKeys.ShowStderr):
+			if m.copyMode {
+				if copyCmd := m.exitCopyMode(); copyCmd != nil {
+					cmds = append(cmds, copyCmd)
+				}
+			}
 			cmds = append(cmds, m.ensurePaneStarted("stderr"))
 			m.mode = TailModeStderr
 			if m.mouseEnabled {
@@ -1326,7 +1461,13 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case key.Matches(msg, tailKeys.CopySelection):
 			if selected := m.selectedText(); selected != "" {
-				cmds = append(cmds, osc52CopyCmd(selected))
+				copyText, truncated := limitUTF8Bytes(selected, maxOSC52Bytes)
+				if truncated {
+					m.copyFeedback = "copied first 100 KiB (selection was larger)"
+				} else {
+					m.copyFeedback = fmt.Sprintf("copied %d bytes", len(copyText))
+				}
+				cmds = append(cmds, osc52CopyCmd(copyText))
 			}
 			return m, tea.Batch(cmds...)
 		case key.Matches(msg, tailKeys.CopyAll):
@@ -1345,7 +1486,13 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if len(lines) > 0 {
 				text := strings.Join(lines, "\n")
-				cmds = append(cmds, osc52CopyCmd(text))
+				copyText, truncated := limitUTF8Bytes(text, maxOSC52Bytes)
+				if truncated {
+					m.copyFeedback = "copied first 100 KiB (pane was larger)"
+				} else {
+					m.copyFeedback = fmt.Sprintf("copied %d bytes", len(copyText))
+				}
+				cmds = append(cmds, osc52CopyCmd(copyText))
 			}
 			// Don't fall through to viewport.Update for this key
 			return m, tea.Batch(cmds...)
@@ -1424,20 +1571,20 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+			previousOffset := 0
 			if targetPane == "stdout" {
+				previousOffset = m.stdoutView.YOffset
 				m.stdoutView, cmd = m.stdoutView.Update(msg)
 				cmds = append(cmds, cmd)
 			} else if targetPane == "stderr" {
+				previousOffset = m.stderrView.YOffset
 				m.stderrView, cmd = m.stderrView.Update(msg)
 				cmds = append(cmds, cmd)
 			}
 
 			if m.selecting && m.selectionPane != "" {
-				if pt, ok := m.paneSelectionPoint(m.selectionPane, msg.X, msg.Y, true); ok {
-					if pt != m.selectionCursor {
-						m.selectionCursor = pt
-						m.refreshPaneContent(m.selectionPane)
-					}
+				if m.extendSelectionAfterWheel(targetPane, previousOffset, msg.X, msg.Y) {
+					m.refreshPaneContent(m.selectionPane)
 				}
 			}
 			break
@@ -1508,6 +1655,13 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		cmds = m.maybeQueueSelectionAutoScroll(cmds)
 
+	case pagerFinishedMsg:
+		if msg.err != nil {
+			m.copyFeedback = fmt.Sprintf("pager error: %v", msg.err)
+		} else {
+			m.copyFeedback = "returned from pager"
+		}
+
 	case tailStartMsg:
 		if msg.session != m.session {
 			break
@@ -1519,8 +1673,8 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for _, line := range msg.initialLines {
 				m.stdoutLines = append(m.stdoutLines, cleanLogLine(line))
 			}
-			if MaxLogLines > 0 && len(m.stdoutLines) > MaxLogLines {
-				m.stdoutLines = m.stdoutLines[len(m.stdoutLines)-MaxLogLines:]
+			if m.maxLogLines > 0 && len(m.stdoutLines) > m.maxLogLines {
+				m.stdoutLines = m.stdoutLines[len(m.stdoutLines)-m.maxLogLines:]
 			}
 			m.refreshStdoutContent()
 			if m.following && !m.paused {
@@ -1541,8 +1695,8 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for _, line := range msg.initialLines {
 				m.stderrLines = append(m.stderrLines, cleanLogLine(line))
 			}
-			if MaxLogLines > 0 && len(m.stderrLines) > MaxLogLines {
-				m.stderrLines = m.stderrLines[len(m.stderrLines)-MaxLogLines:]
+			if m.maxLogLines > 0 && len(m.stderrLines) > m.maxLogLines {
+				m.stderrLines = m.stderrLines[len(m.stderrLines)-m.maxLogLines:]
 			}
 			m.refreshStderrContent()
 			if m.following && !m.paused {
@@ -1564,27 +1718,23 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.session != m.session {
 			break
 		}
-		lineHasContent := msg.err == nil || msg.line != ""
+		incoming := append([]string(nil), msg.lines...)
+		if len(incoming) == 0 && (msg.err == nil || msg.line != "") {
+			incoming = append(incoming, msg.line)
+		}
+		if msg.err != nil {
+			errLine := "EOF (tail exited)"
+			if msg.err != io.EOF {
+				errLine = fmt.Sprintf("Error reading: %v", msg.err)
+			}
+			incoming = append(incoming, errLine)
+		}
 
 		if msg.pane == "stdout" {
-			if lineHasContent {
-				if m.stdoutBuilder == nil {
-					m.stdoutBuilder = &strings.Builder{}
-				}
-				m.appendLogLine("stdout", &m.stdoutLines, &m.wrappedStdout, m.stdoutBuilder, &m.stdoutView, msg.line)
+			if m.stdoutBuilder == nil {
+				m.stdoutBuilder = &strings.Builder{}
 			}
-
-			if msg.err != nil {
-				errLine := "EOF (tail exited)"
-				if msg.err != io.EOF {
-					errLine = fmt.Sprintf("Error reading: %v", msg.err)
-				}
-				if m.stdoutBuilder == nil {
-					m.stdoutBuilder = &strings.Builder{}
-				}
-				m.appendLogLine("stdout", &m.stdoutLines, &m.wrappedStdout, m.stdoutBuilder, &m.stdoutView, errLine)
-			}
-
+			m.appendLogLines("stdout", &m.stdoutLines, &m.wrappedStdout, m.stdoutBuilder, &m.stdoutView, incoming)
 			if !msg.terminal {
 				cmds = append(cmds, m.waitForLine("stdout", m.stdoutReader))
 			} else {
@@ -1597,24 +1747,10 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, cleanupProcessCmd(stdoutCmd, stdoutPipe))
 			}
 		} else {
-			if lineHasContent {
-				if m.stderrBuilder == nil {
-					m.stderrBuilder = &strings.Builder{}
-				}
-				m.appendLogLine("stderr", &m.stderrLines, &m.wrappedStderr, m.stderrBuilder, &m.stderrView, msg.line)
+			if m.stderrBuilder == nil {
+				m.stderrBuilder = &strings.Builder{}
 			}
-
-			if msg.err != nil {
-				errLine := "EOF (tail exited)"
-				if msg.err != io.EOF {
-					errLine = fmt.Sprintf("Error reading: %v", msg.err)
-				}
-				if m.stderrBuilder == nil {
-					m.stderrBuilder = &strings.Builder{}
-				}
-				m.appendLogLine("stderr", &m.stderrLines, &m.wrappedStderr, m.stderrBuilder, &m.stderrView, errLine)
-			}
-
+			m.appendLogLines("stderr", &m.stderrLines, &m.wrappedStderr, m.stderrBuilder, &m.stderrView, incoming)
 			if !msg.terminal {
 				cmds = append(cmds, m.waitForLine("stderr", m.stderrReader))
 			} else {
@@ -1645,17 +1781,17 @@ func (m *TailModel) performSearch(query string, forward bool) {
 	// If single mode, search that mode
 
 	if m.mode == TailModeStdout {
-		lines = m.wrappedStdout
+		lines = flattenWrappedLines(m.wrappedStdout)
 		vp = &m.stdoutView
 	} else if m.mode == TailModeStderr {
-		lines = m.wrappedStderr
+		lines = flattenWrappedLines(m.wrappedStderr)
 		vp = &m.stderrView
 	} else {
 		if m.activePane == 0 {
-			lines = m.wrappedStdout
+			lines = flattenWrappedLines(m.wrappedStdout)
 			vp = &m.stdoutView
 		} else {
-			lines = m.wrappedStderr
+			lines = flattenWrappedLines(m.wrappedStderr)
 			vp = &m.stderrView
 		}
 	}
@@ -1725,27 +1861,6 @@ func (m *TailModel) performSearch(query string, forward bool) {
 }
 
 func (m TailModel) View() string {
-	if m.copyMode {
-		var content string
-		switch m.mode {
-		case TailModeStderr:
-			content = m.stderrView.View()
-		case TailModeBoth:
-			if m.activePane == 1 {
-				content = m.stderrView.View()
-			} else {
-				content = m.stdoutView.View()
-			}
-		default:
-			content = m.stdoutView.View()
-		}
-
-		if m.inSearchMode {
-			return m.renderSearchOverlay(content)
-		}
-		return content
-	}
-
 	toolbar := m.renderToolbar()
 	var stdoutStyle, stderrStyle lipgloss.Style
 
@@ -1910,6 +2025,12 @@ func (m TailModel) renderToolbar() string {
 	if m.mouseEnabled {
 		status = append(status, metaMutedPillStyle.Render("mouse"))
 	}
+	if m.copyMode {
+		status = append(status, metaMutedPillStyle.Render("select: drag, ^y copy, y exit"))
+	}
+	if m.copyFeedback != "" {
+		status = append(status, metaMutedPillStyle.Render(m.copyFeedback))
+	}
 	if m.inSearchMode {
 		status = append(status, metaMutedPillStyle.Render("search"))
 	}
@@ -1975,8 +2096,8 @@ func (m *TailModel) startTailCmd(pane, path string) tea.Cmd {
 		//
 		// This avoids the UI visibly "scrolling down" when opening very long logs.
 		linesArg := "+1"
-		if MaxLogLines > 0 {
-			linesArg = strconv.Itoa(MaxLogLines)
+		if m.maxLogLines > 0 {
+			linesArg = strconv.Itoa(m.maxLogLines)
 		}
 
 		var initialLines []string
@@ -2048,9 +2169,29 @@ func (m *TailModel) waitForLine(pane string, reader *bufio.Reader) tea.Cmd {
 		}
 
 		line, err := reader.ReadString('\n')
-		line = strings.TrimRight(line, "\r\n")
+		lines := []string{}
+		if err == nil || line != "" {
+			lines = append(lines, strings.TrimRight(line, "\r\n"))
+		}
+		if err == nil {
+			time.Sleep(logReadBatchInterval)
+		}
 
-		return logLineMsg{session: m.session, pane: pane, line: line, err: err, terminal: err != nil}
+		for err == nil && len(lines) < maxLogReadBatch && reader.Buffered() > 0 {
+			buffered, peekErr := reader.Peek(reader.Buffered())
+			if peekErr != nil || bytes.IndexByte(buffered, '\n') < 0 {
+				break
+			}
+			next, nextErr := reader.ReadString('\n')
+			if nextErr == nil || next != "" {
+				lines = append(lines, strings.TrimRight(next, "\r\n"))
+			}
+			if nextErr != nil {
+				err = nextErr
+			}
+		}
+
+		return logLineMsg{session: m.session, pane: pane, lines: lines, err: err, terminal: err != nil}
 	}
 }
 

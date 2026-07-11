@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"errors"
+	"testing"
+	"time"
+)
 
 func TestParseDetailsToRowsPreservesValuesWithSpaces(t *testing.T) {
 	input := "JobId=123 JobName=train JobState=RUNNING Reason=None Command=/bin/bash -lc 'python train.py --arg=1' WorkDir=/scratch/my project"
@@ -71,6 +75,49 @@ func TestModelIgnoresStaleDetailsResponse(t *testing.T) {
 
 	if updated.rawDetails != "" {
 		t.Fatalf("expected stale details response to be ignored, got %q", updated.rawDetails)
+	}
+}
+
+func TestModelIgnoresStaleTailPathsResponse(t *testing.T) {
+	m := NewModel()
+	m.tailPathsRequestID = 2
+
+	model, _ := m.Update(tailPathsMsg{
+		requestID: 1,
+		jobID:     "old",
+		stdout:    "/tmp/old.out",
+		mode:      TailModeStdout,
+	})
+	updated := model.(Model)
+	if updated.inTailView {
+		t.Fatalf("expected stale log-path response to be ignored")
+	}
+}
+
+func TestJobsErrorClearsLoadingState(t *testing.T) {
+	m := NewModel()
+	m.appMode = modeHistory
+	m.jobsRequestID = 7
+	m.loadingJobs = true
+
+	model, _ := m.Update(jobsErrMsg{requestID: 7, mode: modeHistory, err: errors.New("sacct unavailable")})
+	updated := model.(Model)
+	if updated.loadingJobs {
+		t.Fatalf("expected matching jobs error to clear loading state")
+	}
+	if updated.err == nil {
+		t.Fatalf("expected matching jobs error to be visible")
+	}
+}
+
+func TestDurationFromEnv(t *testing.T) {
+	t.Setenv("TEST_REFRESH", "45s")
+	if got := durationFromEnv("TEST_REFRESH", time.Minute, time.Second); got != 45*time.Second {
+		t.Fatalf("expected 45s, got %s", got)
+	}
+	t.Setenv("TEST_REFRESH", "30")
+	if got := durationFromEnv("TEST_REFRESH", time.Minute, time.Second); got != 30*time.Second {
+		t.Fatalf("expected integer seconds, got %s", got)
 	}
 }
 
