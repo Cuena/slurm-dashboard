@@ -109,7 +109,7 @@ func TestTailSelectedTextAcrossOffscreenRange(t *testing.T) {
 	}
 }
 
-func TestTailCopyModeTemporarilyEnablesMouse(t *testing.T) {
+func TestTailCopyModeUsesNativeTerminalSelection(t *testing.T) {
 	m := NewTailModel("1", "", "", 80, 12, TailModeStdout)
 	if m.mouseEnabled {
 		t.Fatalf("expected mouse to start disabled")
@@ -119,11 +119,11 @@ func TestTailCopyModeTemporarilyEnablesMouse(t *testing.T) {
 	if !m.copyMode {
 		t.Fatalf("expected copy mode to be active")
 	}
-	if !m.mouseEnabled {
-		t.Fatalf("expected copy mode to enable mouse for in-app selection")
+	if m.mouseEnabled {
+		t.Fatalf("expected copy mode to keep mouse disabled for native terminal selection")
 	}
-	if enterCmd == nil {
-		t.Fatalf("expected enabling mouse command when entering copy mode from mouse-off state")
+	if enterCmd != nil {
+		t.Fatalf("expected no mouse command when entering copy mode from mouse-off state")
 	}
 
 	exitCmd := m.exitCopyMode()
@@ -133,8 +133,47 @@ func TestTailCopyModeTemporarilyEnablesMouse(t *testing.T) {
 	if m.mouseEnabled {
 		t.Fatalf("expected mouse state to be restored after exiting copy mode")
 	}
+	if exitCmd != nil {
+		t.Fatalf("expected no mouse command when exiting copy mode to mouse-off state")
+	}
+
+	m.mouseEnabled = true
+	enterCmd = m.enterCopyMode()
+	if m.mouseEnabled {
+		t.Fatalf("expected copy mode to disable mouse when it was previously enabled")
+	}
+	if enterCmd == nil {
+		t.Fatalf("expected disable-mouse command when entering copy mode from mouse-on state")
+	}
+
+	exitCmd = m.exitCopyMode()
+	if !m.mouseEnabled {
+		t.Fatalf("expected copy mode exit to restore previous mouse-on state")
+	}
 	if exitCmd == nil {
-		t.Fatalf("expected disabling mouse command when restoring mouse-off state")
+		t.Fatalf("expected enable-mouse command when restoring previous mouse-on state")
+	}
+}
+
+func TestTailCopyModeIgnoresMouseSelectionEvents(t *testing.T) {
+	m := NewTailModel("1", "", "", 80, 12, TailModeStdout)
+	for i := 0; i < 40; i++ {
+		m.stdoutLines = append(m.stdoutLines, fmt.Sprintf("line-%03d payload", i))
+	}
+	m.refreshViewportContent()
+	m.enterCopyMode()
+
+	model, _ := m.Update(tea.MouseMsg{
+		X:      6,
+		Y:      4,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		Type:   tea.MouseLeft,
+	})
+	m = model.(TailModel)
+
+	if m.selecting || m.selectionPane != "" {
+		t.Fatalf("expected copy mode to ignore in-app mouse selection, selecting=%v pane=%q", m.selecting, m.selectionPane)
 	}
 }
 
@@ -186,15 +225,12 @@ func TestTailMouseWheelExtendsSelectionWhileDragging(t *testing.T) {
 	}
 }
 
-func TestTailDragSelectionAutoScrollsNearBottomInCopyMode(t *testing.T) {
+func TestTailDragSelectionAutoScrollsNearBottom(t *testing.T) {
 	m := NewTailModel("1", "", "", 90, 20, TailModeStdout)
 	for i := 0; i < 160; i++ {
 		m.stdoutLines = append(m.stdoutLines, fmt.Sprintf("line-%03d payload", i))
 	}
 	m.refreshStdoutContent()
-	if cmd := m.enterCopyMode(); cmd == nil {
-		t.Fatalf("expected copy mode to request mouse enable")
-	}
 
 	geom, ok := m.paneGeometry("stdout")
 	if !ok {
@@ -243,9 +279,6 @@ func TestTailSelectionAutoScrollTickContinuesWithoutMouseMotion(t *testing.T) {
 		m.stdoutLines = append(m.stdoutLines, fmt.Sprintf("line-%03d payload", i))
 	}
 	m.refreshStdoutContent()
-	if cmd := m.enterCopyMode(); cmd == nil {
-		t.Fatalf("expected copy mode to request mouse enable")
-	}
 
 	geom, ok := m.paneGeometry("stdout")
 	if !ok {

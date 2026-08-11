@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	"github.com/charmbracelet/bubbles/table"
+)
 
 func TestParseDetailsToRowsPreservesValuesWithSpaces(t *testing.T) {
 	input := "JobId=123 JobName=train JobState=RUNNING Reason=None Command=/bin/bash -lc 'python train.py --arg=1' WorkDir=/scratch/my project"
@@ -56,6 +61,41 @@ func TestModelIgnoresStaleJobsResponse(t *testing.T) {
 	}
 }
 
+func TestModelIgnoresStaleJobsError(t *testing.T) {
+	m := NewModel()
+	m.appMode = modeLive
+	m.jobsRequestID = 3
+
+	model, _ := m.Update(jobsErrMsg{
+		requestID: 2,
+		mode:      modeLive,
+		err:       errors.New("command timed out"),
+	})
+	updated := model.(Model)
+
+	if updated.err != nil {
+		t.Fatalf("expected stale jobs error to be ignored, got %v", updated.err)
+	}
+}
+
+func TestModelClearsErrorOnJobsSuccess(t *testing.T) {
+	m := NewModel()
+	m.appMode = modeLive
+	m.jobsRequestID = 3
+	m.err = errors.New("command timed out")
+
+	model, _ := m.Update(jobsMsg{
+		requestID: 3,
+		mode:      modeLive,
+		jobs:      []Job{{JobID: "1", Status: "R"}},
+	})
+	updated := model.(Model)
+
+	if updated.err != nil {
+		t.Fatalf("expected jobs success to clear error, got %v", updated.err)
+	}
+}
+
 func TestModelIgnoresStaleDetailsResponse(t *testing.T) {
 	m := NewModel()
 	m.selectedID = "current"
@@ -71,6 +111,49 @@ func TestModelIgnoresStaleDetailsResponse(t *testing.T) {
 
 	if updated.rawDetails != "" {
 		t.Fatalf("expected stale details response to be ignored, got %q", updated.rawDetails)
+	}
+}
+
+func TestJobTableRowMapsValuesByColumnTitle(t *testing.T) {
+	row := newJobTableRow(Job{
+		JobID:  "123",
+		Name:   "train",
+		Status: "RUNNING",
+	}).tableRow([]table.Column{
+		{Title: jobColumnStatus},
+		{Title: jobColumnID},
+		{Title: jobColumnName},
+	})
+
+	if got, want := row[0], "R"; got != want {
+		t.Fatalf("status cell = %q, want %q", got, want)
+	}
+	if got, want := row[1], "123"; got != want {
+		t.Fatalf("id cell = %q, want %q", got, want)
+	}
+	if got, want := row[2], "train"; got != want {
+		t.Fatalf("name cell = %q, want %q", got, want)
+	}
+}
+
+func TestSelectedJobUsesFilteredCursorNotTableRowPosition(t *testing.T) {
+	m := NewModel()
+	m.jobs = []Job{
+		{JobID: "101", Name: "first", Status: "RUNNING"},
+		{JobID: "102", Name: "second", Status: "PENDING"},
+	}
+	m.table.SetColumns([]table.Column{
+		{Title: jobColumnName, Width: 12},
+		{Title: jobColumnID, Width: 8},
+	})
+	m.updateTable()
+	m.table.SetCursor(1)
+
+	if got, want := m.selectedJobID(), "102"; got != want {
+		t.Fatalf("selected job ID = %q, want %q", got, want)
+	}
+	if job := m.getSelectedJob(); job == nil || job.JobID != "102" {
+		t.Fatalf("selected job = %+v, want job 102", job)
 	}
 }
 

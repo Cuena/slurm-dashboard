@@ -138,6 +138,9 @@ type TailModel struct {
 	wrappedStdout []string
 	wrappedStderr []string
 
+	stdoutVisualLines []string
+	stderrVisualLines []string
+
 	// Cached, incrementally-built viewport content for each pane. This avoids
 	// re-joining all lines on every appended log line.
 	//
@@ -254,24 +257,26 @@ var tailSelectionStyle = lipgloss.NewStyle().
 
 func NewTailModel(jobID, stdoutPath, stderrPath string, width, height int, mode TailMode) TailModel {
 	m := TailModel{
-		session:       nextTailSessionID(),
-		jobID:         jobID,
-		stdoutPath:    stdoutPath,
-		stderrPath:    stderrPath,
-		mode:          mode,
-		stdoutStarted: mode == TailModeBoth || mode == TailModeStdout,
-		stderrStarted: mode == TailModeBoth || mode == TailModeStderr,
-		stdoutLines:   []string{},
-		stderrLines:   []string{},
-		wrappedStdout: []string{},
-		wrappedStderr: []string{},
-		stdoutBuilder: &strings.Builder{},
-		stderrBuilder: &strings.Builder{},
-		width:         width,
-		height:        height,
-		following:     true,
-		showBorders:   true,
-		styles:        DefaultTailStyles(),
+		session:           nextTailSessionID(),
+		jobID:             jobID,
+		stdoutPath:        stdoutPath,
+		stderrPath:        stderrPath,
+		mode:              mode,
+		stdoutStarted:     mode == TailModeBoth || mode == TailModeStdout,
+		stderrStarted:     mode == TailModeBoth || mode == TailModeStderr,
+		stdoutLines:       []string{},
+		stderrLines:       []string{},
+		wrappedStdout:     []string{},
+		wrappedStderr:     []string{},
+		stdoutVisualLines: []string{},
+		stderrVisualLines: []string{},
+		stdoutBuilder:     &strings.Builder{},
+		stderrBuilder:     &strings.Builder{},
+		width:             width,
+		height:            height,
+		following:         true,
+		showBorders:       true,
+		styles:            DefaultTailStyles(),
 	}
 
 	// Search init
@@ -357,8 +362,11 @@ func (m *TailModel) recalculateLayout() {
 		return
 	}
 
-	// Reserve space for the shared toolbar, pane chrome, and a small safety buffer.
-	vpHeight := m.height - 5 - tailToolbarHeight
+	vpHeight := m.height
+	if !m.copyMode {
+		// Reserve space for the shared toolbar, pane chrome, and a small safety buffer.
+		vpHeight = m.height - 5 - tailToolbarHeight
+	}
 	if m.inSearchMode {
 		vpHeight -= searchOverlayHeight
 	}
@@ -373,7 +381,14 @@ func (m *TailModel) recalculateLayout() {
 	stdoutHeight = vpHeight
 	stderrHeight = vpHeight
 
-	if m.mode == TailModeBoth {
+	if m.copyMode {
+		avail := m.width
+		if avail < 10 {
+			avail = 10
+		}
+		stdoutWidth = avail
+		stderrWidth = avail
+	} else if m.mode == TailModeBoth {
 		if m.stacked {
 			// Top/Bottom split
 			// Reduce width to avoid right edge overflow
@@ -456,7 +471,7 @@ func cleanLogLine(line string) string {
 	return line
 }
 
-func (m *TailModel) appendLogLine(pane string, lines *[]string, wrapped *[]string, b *strings.Builder, view *viewport.Model, text string) {
+func (m *TailModel) appendLogLine(pane string, lines *[]string, wrapped *[]string, visual *[]string, b *strings.Builder, view *viewport.Model, text string) {
 	cleanLine := cleanLogLine(text)
 	*lines = append(*lines, cleanLine)
 	if MaxLogLines > 0 && len(*lines) > MaxLogLines {
@@ -465,6 +480,7 @@ func (m *TailModel) appendLogLine(pane string, lines *[]string, wrapped *[]strin
 
 	wrappedLine := m.wrapLine(cleanLine, view.Width)
 	*wrapped = append(*wrapped, wrappedLine)
+	*visual = append(*visual, splitVisualBlock(wrappedLine)...)
 
 	visualLinesRemoved := 0
 	trimmedWrapped := false
@@ -472,6 +488,11 @@ func (m *TailModel) appendLogLine(pane string, lines *[]string, wrapped *[]strin
 		removedBlock := (*wrapped)[0]
 		visualLinesRemoved = visualLineCount(removedBlock)
 		*wrapped = (*wrapped)[1:]
+		if visualLinesRemoved >= len(*visual) {
+			*visual = (*visual)[:0]
+		} else {
+			*visual = (*visual)[visualLinesRemoved:]
+		}
 		trimmedWrapped = true
 	}
 	m.adjustSelectionAfterTrim(pane, visualLinesRemoved)
@@ -548,6 +569,10 @@ func flattenWrappedLines(wrapped []string) []string {
 	return lines
 }
 
+func splitVisualBlock(block string) []string {
+	return strings.Split(block, "\n")
+}
+
 func visualLineCount(block string) int {
 	return strings.Count(block, "\n") + 1
 }
@@ -573,15 +598,54 @@ func runeSlice(s string, start, end int) string {
 func (m TailModel) paneVisualLines(pane string) []string {
 	switch pane {
 	case "stdout":
-		return flattenWrappedLines(m.wrappedStdout)
+		return m.stdoutVisualLines
 	case "stderr":
-		return flattenWrappedLines(m.wrappedStderr)
+		return m.stderrVisualLines
 	default:
 		return nil
 	}
 }
 
 func (m TailModel) paneGeometry(pane string) (paneGeometry, bool) {
+	if m.copyMode {
+		makeCopyGeom := func(vpWidth, vpHeight int) paneGeometry {
+			return paneGeometry{
+				x:             0,
+				y:             0,
+				width:         vpWidth,
+				height:        vpHeight,
+				contentX:      0,
+				contentY:      0,
+				contentWidth:  vpWidth,
+				contentHeight: vpHeight,
+			}
+		}
+
+		switch m.mode {
+		case TailModeStderr:
+			if pane != "stderr" {
+				return paneGeometry{}, false
+			}
+			return makeCopyGeom(m.stderrView.Width, m.stderrView.Height), true
+		case TailModeBoth:
+			if m.activePane == 1 {
+				if pane != "stderr" {
+					return paneGeometry{}, false
+				}
+				return makeCopyGeom(m.stderrView.Width, m.stderrView.Height), true
+			}
+			if pane != "stdout" {
+				return paneGeometry{}, false
+			}
+			return makeCopyGeom(m.stdoutView.Width, m.stdoutView.Height), true
+		default:
+			if pane != "stdout" {
+				return paneGeometry{}, false
+			}
+			return makeCopyGeom(m.stdoutView.Width, m.stdoutView.Height), true
+		}
+	}
+
 	headerHeight := 1
 	borderX := 2
 	borderY := 2
@@ -726,11 +790,20 @@ func (m TailModel) paneSelectionPoint(pane string, x, y int, clampToViewport boo
 }
 
 func (m *TailModel) refreshPaneContent(pane string) {
+	needle := strings.ToLower(m.activeSearchTerm())
 	switch pane {
 	case "stdout":
-		m.refreshStdoutContent()
+		if m.stdoutBuilder == nil {
+			m.stdoutBuilder = &strings.Builder{}
+		}
+		m.rebuildPaneContent("stdout", m.stdoutBuilder, m.wrappedStdout, needle)
+		m.stdoutView.SetContent(m.stdoutBuilder.String())
 	case "stderr":
-		m.refreshStderrContent()
+		if m.stderrBuilder == nil {
+			m.stderrBuilder = &strings.Builder{}
+		}
+		m.rebuildPaneContent("stderr", m.stderrBuilder, m.wrappedStderr, needle)
+		m.stderrView.SetContent(m.stderrBuilder.String())
 	}
 }
 
@@ -1022,6 +1095,7 @@ func (m *TailModel) refreshStdoutContent() {
 	for _, line := range m.stdoutLines {
 		m.wrappedStdout = append(m.wrappedStdout, m.wrapLine(line, m.stdoutView.Width))
 	}
+	m.stdoutVisualLines = flattenWrappedLines(m.wrappedStdout)
 	if m.stdoutBuilder == nil {
 		m.stdoutBuilder = &strings.Builder{}
 	}
@@ -1034,6 +1108,7 @@ func (m *TailModel) refreshStderrContent() {
 	for _, line := range m.stderrLines {
 		m.wrappedStderr = append(m.wrappedStderr, m.wrapLine(line, m.stderrView.Width))
 	}
+	m.stderrVisualLines = flattenWrappedLines(m.wrappedStderr)
 	if m.stderrBuilder == nil {
 		m.stderrBuilder = &strings.Builder{}
 	}
@@ -1065,9 +1140,9 @@ func (m *TailModel) enterCopyMode() tea.Cmd {
 	m.showBorders = false
 	m.recalculateLayout()
 
-	if !m.prevMouseEnabled {
-		m.mouseEnabled = true
-		return tea.EnableMouseCellMotion
+	if m.prevMouseEnabled {
+		m.mouseEnabled = false
+		return tea.DisableMouse
 	}
 	return nil
 }
@@ -1084,9 +1159,9 @@ func (m *TailModel) exitCopyMode() tea.Cmd {
 	m.activePane = m.prevActivePane
 	m.recalculateLayout()
 
-	if !m.prevMouseEnabled {
-		m.mouseEnabled = false
-		return tea.DisableMouse
+	if m.prevMouseEnabled {
+		m.mouseEnabled = true
+		return tea.EnableMouseCellMotion
 	}
 	return nil
 }
@@ -1211,6 +1286,8 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stderrLines = []string{}
 			m.wrappedStdout = []string{}
 			m.wrappedStderr = []string{}
+			m.stdoutVisualLines = []string{}
+			m.stderrVisualLines = []string{}
 			m.clearSelection()
 			if m.stdoutBuilder != nil {
 				m.stdoutBuilder.Reset()
@@ -1399,6 +1476,10 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
+		if m.copyMode {
+			break
+		}
+
 		pane := m.paneFromMouse(msg.X, msg.Y)
 		if pane == "stdout" {
 			m.activePane = 0
@@ -1571,7 +1652,7 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.stdoutBuilder == nil {
 					m.stdoutBuilder = &strings.Builder{}
 				}
-				m.appendLogLine("stdout", &m.stdoutLines, &m.wrappedStdout, m.stdoutBuilder, &m.stdoutView, msg.line)
+				m.appendLogLine("stdout", &m.stdoutLines, &m.wrappedStdout, &m.stdoutVisualLines, m.stdoutBuilder, &m.stdoutView, msg.line)
 			}
 
 			if msg.err != nil {
@@ -1582,7 +1663,7 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.stdoutBuilder == nil {
 					m.stdoutBuilder = &strings.Builder{}
 				}
-				m.appendLogLine("stdout", &m.stdoutLines, &m.wrappedStdout, m.stdoutBuilder, &m.stdoutView, errLine)
+				m.appendLogLine("stdout", &m.stdoutLines, &m.wrappedStdout, &m.stdoutVisualLines, m.stdoutBuilder, &m.stdoutView, errLine)
 			}
 
 			if !msg.terminal {
@@ -1601,7 +1682,7 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.stderrBuilder == nil {
 					m.stderrBuilder = &strings.Builder{}
 				}
-				m.appendLogLine("stderr", &m.stderrLines, &m.wrappedStderr, m.stderrBuilder, &m.stderrView, msg.line)
+				m.appendLogLine("stderr", &m.stderrLines, &m.wrappedStderr, &m.stderrVisualLines, m.stderrBuilder, &m.stderrView, msg.line)
 			}
 
 			if msg.err != nil {
@@ -1612,7 +1693,7 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.stderrBuilder == nil {
 					m.stderrBuilder = &strings.Builder{}
 				}
-				m.appendLogLine("stderr", &m.stderrLines, &m.wrappedStderr, m.stderrBuilder, &m.stderrView, errLine)
+				m.appendLogLine("stderr", &m.stderrLines, &m.wrappedStderr, &m.stderrVisualLines, m.stderrBuilder, &m.stderrView, errLine)
 			}
 
 			if !msg.terminal {

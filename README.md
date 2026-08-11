@@ -83,7 +83,7 @@ Or:
 - `Tab`: switch active pane (in dual pane mode)
 - `s`: toggle split layout
 - `x`: toggle borders
-- `y`: copy mode
+- `y`: native terminal copy mode
 - `Ctrl+y`: copy selection
 - `Y`: copy full active pane
 - `v`: open active log in pager (`$PAGER` or `vim -R`)
@@ -94,7 +94,7 @@ Copy uses OSC52, so clipboard support depends on your terminal/tmux setup.
 
 ## Environment Variables
 
-- `SLURM_DASHBOARD_THEME=auto|dark|light`: UI theme selection.
+- `SLURM_DASHBOARD_THEME=auto|dark|light`: UI theme selection. `auto` detects the terminal background at startup.
 - `SLURM_DASHBOARD_SURFACES=transparent|solid`: background style (terminal-dependent).
 - `SLURM_DASHBOARD_PALETTE=dracula-soft|classic`: color palette.
 - `SLURM_DASHBOARD_HISTORY_DAYS=<positive-integer>` (default: `3`): history window for `sacct` mode.

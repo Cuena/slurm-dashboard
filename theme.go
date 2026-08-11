@@ -68,17 +68,14 @@ type Theme struct {
 var theme = loadTheme()
 
 func loadTheme() Theme {
-	mode := parseThemeMode(os.Getenv(envTheme))
+	configuredMode := parseThemeMode(os.Getenv(envTheme))
+	mode := resolveThemeMode(
+		configuredMode,
+		lipgloss.HasDarkBackground(),
+	)
 	surfacesRaw := os.Getenv(envSurfaces)
 	surfaces := parseSurfaceMode(surfacesRaw)
 	palette := parsePalette(os.Getenv(envPalette))
-
-	// Transparent surfaces work well in dark terminals, but on a light terminal
-	// they make the panels and chips feel washed out unless the user explicitly
-	// opted into transparency.
-	if mode == ThemeLight && strings.TrimSpace(surfacesRaw) == "" {
-		surfaces = SurfaceSolid
-	}
 
 	if mode == ThemeDark {
 		lipgloss.SetHasDarkBackground(true)
@@ -87,6 +84,16 @@ func loadTheme() Theme {
 	}
 
 	return newTheme(mode, surfaces, palette)
+}
+
+func resolveThemeMode(mode ThemeMode, hasDarkBackground bool) ThemeMode {
+	if mode != ThemeAuto {
+		return mode
+	}
+	if hasDarkBackground {
+		return ThemeDark
+	}
+	return ThemeLight
 }
 
 func parseThemeMode(value string) ThemeMode {

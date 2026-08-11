@@ -32,6 +32,16 @@ const (
 	maxDetailsPanelWidth = 50
 )
 
+const (
+	jobColumnID        = "Job ID"
+	jobColumnName      = "Name"
+	jobColumnStatus    = "Status"
+	jobColumnTime      = "Time"
+	jobColumnNodes     = "Nodes"
+	jobColumnPartition = "Partition"
+	jobColumnNodeList  = "Nodelist"
+)
+
 type mode int
 
 const (
@@ -56,6 +66,63 @@ func (s statusFilter) String() string {
 	default:
 		return "All"
 	}
+}
+
+type jobTableRow struct {
+	id        string
+	name      string
+	status    string
+	time      string
+	nodes     string
+	partition string
+	nodeList  string
+}
+
+func newJobTableRow(j Job) jobTableRow {
+	return jobTableRow{
+		id:        j.JobID,
+		name:      j.Name,
+		status:    truncateTableValue(j.State(), 12),
+		time:      truncateTableValue(j.Time, 12),
+		nodes:     truncateTableValue(j.Nodes, 8),
+		partition: truncateTableValue(j.Partition, 12),
+		nodeList:  truncateTableValue(j.NodeList, 20),
+	}
+}
+
+func (r jobTableRow) tableRow(columns []table.Column) table.Row {
+	row := make(table.Row, 0, len(columns))
+	for _, col := range columns {
+		switch col.Title {
+		case jobColumnID:
+			row = append(row, r.id)
+		case jobColumnName:
+			row = append(row, r.name)
+		case jobColumnStatus:
+			row = append(row, r.status)
+		case jobColumnTime:
+			row = append(row, r.time)
+		case jobColumnNodes:
+			row = append(row, r.nodes)
+		case jobColumnPartition:
+			row = append(row, r.partition)
+		case jobColumnNodeList:
+			row = append(row, r.nodeList)
+		default:
+			row = append(row, "")
+		}
+	}
+	return row
+}
+
+func truncateTableValue(s string, max int) string {
+	if len(s) > max {
+		if max > 3 {
+			return s[:max-3] + "..."
+		}
+		return s[:max]
+	}
+	return s
 }
 
 // KeyMap defines the keybindings
@@ -119,6 +186,11 @@ type jobsMsg struct {
 	requestID int
 	mode      mode
 	jobs      []Job
+}
+type jobsErrMsg struct {
+	requestID int
+	mode      mode
+	err       error
 }
 type detailsMsg struct {
 	requestID int
@@ -203,13 +275,13 @@ type Model struct {
 func NewModel() Model {
 	// Table setup
 	columns := []table.Column{
-		{Title: "Job ID", Width: 8},
-		{Title: "Name", Width: 16},
-		{Title: "Status", Width: 10},
-		{Title: "Time", Width: 10},
-		{Title: "Nodes", Width: 6},
-		{Title: "Partition", Width: 10},
-		{Title: "Nodelist", Width: 15},
+		{Title: jobColumnID, Width: 8},
+		{Title: jobColumnName, Width: 16},
+		{Title: jobColumnStatus, Width: 10},
+		{Title: jobColumnTime, Width: 10},
+		{Title: jobColumnNodes, Width: 6},
+		{Title: jobColumnPartition, Width: 10},
+		{Title: jobColumnNodeList, Width: 15},
 	}
 
 	t := table.New(
@@ -541,13 +613,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.jobs = msg.jobs
 		m.lastRefresh = time.Now()
+		m.err = nil
 		m.loadingJobs = false
 		m.updateTable()
 
 		// Sync selection immediately
-		sel := m.table.SelectedRow()
-		if len(sel) > 0 {
-			id := jobIDFromTableRow(sel)
+		if id := m.selectedJobID(); id != "" {
 			// If selection changed or we haven't loaded details yet (e.g. startup).
 			// When details are hidden (small window), avoid fetching details on every
 			// selection change; fetch on-demand when opening the overlay.
@@ -560,6 +631,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.refreshSelectedDetails = false
+
+	case jobsErrMsg:
+		if msg.requestID != m.jobsRequestID || msg.mode != m.appMode {
+			break
+		}
+		m.err = msg.err
+		m.loadingJobs = false
 
 	case detailsMsg:
 		if msg.requestID != m.detailsRequestID || msg.jobID != m.selectedID || msg.history != (m.appMode == modeHistory) {
@@ -747,15 +825,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.table, cmd = m.table.Update(msg)
 		cmds = append(cmds, cmd)
 
-		sel := m.table.SelectedRow()
-		if len(sel) > 0 {
-			id := jobIDFromTableRow(sel)
-			if id != m.selectedID {
-				m.selectedID = id
-				m.updateTable()
-				if !m.hideDetails {
-					cmds = append(cmds, m.queueDetailsFetchCmd(id))
-				}
+		if id := m.selectedJobID(); id != "" && id != m.selectedID {
+			m.selectedID = id
+			m.updateTable()
+			if !m.hideDetails {
+				cmds = append(cmds, m.queueDetailsFetchCmd(id))
 			}
 		}
 	}
@@ -1763,10 +1837,10 @@ func (m Model) responsiveTableColumns(contentWidth int) []table.Column {
 		width int
 	}
 	optionals := []optCol{
-		{"Time", 10},
-		{"Nodes", 6},
-		{"Partition", 10},
-		{"Nodelist", 15},
+		{jobColumnTime, 10},
+		{jobColumnNodes, 6},
+		{jobColumnPartition, 10},
+		{jobColumnNodeList, 15},
 	}
 
 	widthCost := func(raw int) int {
@@ -1787,9 +1861,9 @@ func (m Model) responsiveTableColumns(contentWidth int) []table.Column {
 		nameW = nameMin
 	}
 	cols := []table.Column{
-		{Title: "Job ID", Width: idW},
-		{Title: "Name", Width: nameW},
-		{Title: "Status", Width: statusW},
+		{Title: jobColumnID, Width: idW},
+		{Title: jobColumnName, Width: nameW},
+		{Title: jobColumnStatus, Width: statusW},
 	}
 	for _, c := range chosen {
 		cols = append(cols, table.Column{Title: c.title, Width: c.width})
@@ -2149,12 +2223,11 @@ func parseHistoryDetailsToRows(text string) []table.Row {
 }
 
 func (m *Model) getSelectedJob() *Job {
-	sel := m.table.SelectedRow()
-	if len(sel) == 0 {
+	id := m.selectedJobID()
+	if id == "" {
 		return nil
 	}
 
-	id := jobIDFromTableRow(sel)
 	for i := range m.jobs {
 		if m.jobs[i].JobID == id {
 			return &m.jobs[i]
@@ -2163,27 +2236,24 @@ func (m *Model) getSelectedJob() *Job {
 	return nil
 }
 
+func (m *Model) selectedJobID() string {
+	cursor := m.table.Cursor()
+	if cursor < 0 || cursor >= len(m.filtered) {
+		return ""
+	}
+	return strings.TrimSpace(m.filtered[cursor].JobID)
+}
+
 func (m *Model) setTableCursorByJobID(jobID string) {
 	if jobID == "" {
 		return
 	}
-	rows := m.table.Rows()
-	for i, row := range rows {
-		if len(row) == 0 {
-			continue
-		}
-		if jobIDFromTableRow(row) == jobID {
+	for i := range m.filtered {
+		if m.filtered[i].JobID == jobID {
 			m.table.SetCursor(i)
 			return
 		}
 	}
-}
-
-func jobIDFromTableRow(row table.Row) string {
-	if len(row) == 0 {
-		return ""
-	}
-	return strings.TrimSpace(row[0])
 }
 
 func (m *Model) updateTable() {
@@ -2215,44 +2285,12 @@ func (m *Model) updateTable() {
 	}
 
 	rows := []table.Row{}
-	// Helper to truncate strings
-	truncate := func(s string, max int) string {
-		if len(s) > max {
-			if max > 3 {
-				return s[:max-3] + "..."
-			}
-			return s[:max]
-		}
-		return s
-	}
+	currentCols := m.table.Columns()
 
 	for _, j := range m.filtered {
-		status := j.State()
 		// Note: ANSI colors removed as they interfere with table column width calculation
 		// causing truncation (e.g. "P...") and layout shifting.
-
-		// Create row based on current columns
-		// We must match the number of columns currently set in the table
-		currentCols := m.table.Columns()
-
-		// Standard row data
-		fullRow := []string{
-			j.JobID,
-			j.Name,
-			truncate(status, 12),
-			truncate(j.Time, 12),
-			truncate(j.Nodes, 8),
-			truncate(j.Partition, 12),
-			truncate(j.NodeList, 20),
-		}
-
-		// Slice row data to match column count
-		// This prevents "index out of range" if we are in compact mode
-		if len(currentCols) < len(fullRow) {
-			rows = append(rows, fullRow[:len(currentCols)])
-		} else {
-			rows = append(rows, fullRow)
-		}
+		rows = append(rows, newJobTableRow(j).tableRow(currentCols))
 	}
 	m.table.SetRows(rows)
 }
@@ -2301,13 +2339,13 @@ func (m Model) fetchJobsCmd() tea.Cmd {
 		if requestMode == modeHistory {
 			jobs, err := FetchJobsHistory(historyDays)
 			if err != nil {
-				return errMsg(err)
+				return jobsErrMsg{requestID: requestID, mode: requestMode, err: err}
 			}
 			return jobsMsg{requestID: requestID, mode: requestMode, jobs: jobs}
 		}
 		jobs, err := FetchJobsSqueue()
 		if err != nil {
-			return errMsg(err)
+			return jobsErrMsg{requestID: requestID, mode: requestMode, err: err}
 		}
 		return jobsMsg{requestID: requestID, mode: requestMode, jobs: jobs}
 	}

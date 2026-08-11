@@ -1,5 +1,6 @@
 .cache
 .gocache
+.codex
 scripts/
 rsync-alogin1.local.sh
 
