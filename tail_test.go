@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func runTeaCmd(cmd tea.Cmd) []tea.Msg {
@@ -109,6 +110,22 @@ func TestTailSelectedTextAcrossOffscreenRange(t *testing.T) {
 	}
 }
 
+func TestTailSelectionDoesNotInsertNewlinesAtVisualWraps(t *testing.T) {
+	m := NewTailModel("1", "", "", 24, 12, TailModeStdout)
+	m.stdoutLines = []string{strings.Repeat("word ", 20)}
+	m.refreshStdoutContent()
+	visual := m.paneVisualLines("stdout")
+	if len(visual) < 2 {
+		t.Fatalf("expected wrapped visual lines")
+	}
+	m.selectionPane = "stdout"
+	m.selectionAnchor = selectionPoint{line: 0, col: 0}
+	m.selectionCursor = selectionPoint{line: 1, col: runeLen(visual[1])}
+	if got := m.selectedText(); strings.Contains(got, "\n") {
+		t.Fatalf("visual wrapping must not add copied newlines: %q", got)
+	}
+}
+
 func TestTailCopyModeUsesNativeTerminalSelection(t *testing.T) {
 	m := NewTailModel("1", "", "", 80, 12, TailModeStdout)
 	if m.mouseEnabled {
@@ -177,6 +194,73 @@ func TestTailCopyModeIgnoresMouseSelectionEvents(t *testing.T) {
 	}
 }
 
+func TestTailCopyModeViewMatchesSelectionGeometry(t *testing.T) {
+	m := NewTailModel("1", "", "", 80, 16, TailModeStdout)
+	m.stdoutLines = []string{"first-visible-line", "second-visible-line"}
+	m.refreshStdoutContent()
+	m.enterCopyMode()
+
+	geom, ok := m.paneGeometry("stdout")
+	if !ok {
+		t.Fatalf("expected stdout geometry")
+	}
+	rendered := strings.Split(m.View(), "\n")
+	if geom.contentY >= len(rendered) || !strings.Contains(rendered[geom.contentY], "first-visible-line") {
+		t.Fatalf("selection geometry row %d does not contain the first rendered log line", geom.contentY)
+	}
+}
+
+func TestTailLongPathHeaderStaysOnOneLine(t *testing.T) {
+	m := NewTailModel("1", strings.Repeat("/very-long-directory", 12)+"/job.out", "", 80, 16, TailModeStdout)
+	m.stdoutLines = []string{"first log line"}
+	m.refreshStdoutContent()
+	viewLines := strings.Split(m.View(), "\n")
+	toolbarHeight := lipgloss.Height(m.renderToolbar())
+	geom, ok := m.paneGeometry("stdout")
+	if !ok {
+		t.Fatalf("expected stdout geometry")
+	}
+	if geom.contentY != toolbarHeight+2 {
+		t.Fatalf("expected exactly one header and one border row, toolbar=%d contentY=%d", toolbarHeight, geom.contentY)
+	}
+	if geom.contentY >= len(viewLines) || !strings.Contains(viewLines[geom.contentY], "first log line") {
+		t.Fatalf("long path pushed log content away from expected row")
+	}
+}
+
+func TestTailPaneSwitchExitsCopyMode(t *testing.T) {
+	m := NewTailModel("1", "", "", 80, 16, TailModeStdout)
+	m.enterCopyMode()
+	model, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'e'}})
+	updated := model.(TailModel)
+	if updated.copyMode {
+		t.Fatalf("expected pane switch to exit copy mode")
+	}
+	if updated.mode != TailModeStderr {
+		t.Fatalf("expected stderr mode, got %v", updated.mode)
+	}
+}
+
+func TestLimitUTF8BytesDoesNotSplitRune(t *testing.T) {
+	got, truncated := limitUTF8Bytes("ab€cd", 4)
+	if !truncated {
+		t.Fatalf("expected truncation")
+	}
+	if got != "ab" {
+		t.Fatalf("expected complete UTF-8 prefix, got %q", got)
+	}
+}
+
+func TestTailSearchUsesVisualWrappedLineOffsets(t *testing.T) {
+	m := NewTailModel("1", "", "", 24, 12, TailModeStdout)
+	m.stdoutLines = []string{strings.Repeat("word ", 20), "needle"}
+	m.refreshStdoutContent()
+	m.performSearch("needle", true)
+	if m.stdoutView.YOffset < 2 {
+		t.Fatalf("expected match after wrapped visual lines, got offset %d", m.stdoutView.YOffset)
+	}
+}
+
 func TestTailMouseWheelExtendsSelectionWhileDragging(t *testing.T) {
 	m := NewTailModel("1", "", "", 90, 20, TailModeStdout)
 	for i := 0; i < 120; i++ {
@@ -222,6 +306,42 @@ func TestTailMouseWheelExtendsSelectionWhileDragging(t *testing.T) {
 	expectedLines := m.selectionCursor.line - m.selectionAnchor.line + 1
 	if gotLines := strings.Count(selected, "\n") + 1; gotLines != expectedLines {
 		t.Fatalf("expected %d selected lines, got %d", expectedLines, gotLines)
+	}
+}
+
+func TestTailWheelUpKeepsLowerSelectionEndpointAttachedToContent(t *testing.T) {
+	m := NewTailModel("1", "", "", 90, 20, TailModeStdout)
+	for i := 0; i < 120; i++ {
+		m.stdoutLines = append(m.stdoutLines, fmt.Sprintf("line-%03d payload", i))
+	}
+	m.refreshStdoutContent()
+	m.stdoutView.YOffset = 50
+	m.selectionPane = "stdout"
+	m.selectionAnchor = selectionPoint{line: 50, col: 0}
+	m.selectionCursor = selectionPoint{line: 60, col: 8}
+	m.selecting = true
+
+	geom, ok := m.paneGeometry("stdout")
+	if !ok {
+		t.Fatalf("expected stdout geometry")
+	}
+	model, _ := m.Update(tea.MouseMsg{
+		X:      geom.contentX + 4,
+		Y:      geom.contentY + 2,
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelUp,
+		Type:   tea.MouseWheelUp,
+	})
+	updated := model.(TailModel)
+	start, end := normalizeSelection(updated.selectionAnchor, updated.selectionCursor)
+	if end.line != 60 || end.col != 8 {
+		t.Fatalf("expected lower endpoint to remain on original content, got %+v", end)
+	}
+	if start.line >= 50 {
+		t.Fatalf("expected wheel-up to extend selection upward, got start line %d", start.line)
+	}
+	if updated.stdoutView.YOffset >= 50 {
+		t.Fatalf("expected viewport to scroll upward, got offset %d", updated.stdoutView.YOffset)
 	}
 }
 

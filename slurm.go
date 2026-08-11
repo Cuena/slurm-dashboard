@@ -105,7 +105,11 @@ func CurrentUser() string {
 }
 
 func RunCommand(args []string, timeout time.Duration) (string, error) {
-	ctx := context.Background()
+	return RunCommandContext(context.Background(), args, timeout)
+}
+
+func RunCommandContext(parent context.Context, args []string, timeout time.Duration) (string, error) {
+	ctx := parent
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -120,7 +124,10 @@ func RunCommand(args []string, timeout time.Duration) (string, error) {
 
 	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
-		return "", fmt.Errorf("command timed out after %s: %v, stderr: %s", timeout, err, stderr.String())
+		return "", fmt.Errorf("%w after %s: %v, stderr: %s", context.DeadlineExceeded, timeout, err, stderr.String())
+	}
+	if ctx.Err() == context.Canceled {
+		return "", context.Canceled
 	}
 	if err != nil {
 		return "", fmt.Errorf("command failed: %v, stderr: %s", err, stderr.String())
@@ -128,16 +135,19 @@ func RunCommand(args []string, timeout time.Duration) (string, error) {
 	return stdout.String(), nil
 }
 
-// FetchJobsSqueue fetches jobs using squeue
-func FetchJobsSqueue() ([]Job, error) {
+func FetchJobsSqueueContext(ctx context.Context) ([]Job, error) {
 	user := CurrentUser()
 	format := "%i|%j|%u|%t|%P|%M|%D|%N"
-
-	out, err := RunCommand([]string{"squeue", "-u", user, "-o", format, "--noheader"}, 10*time.Second)
+	out, err := RunCommandContext(ctx, []string{"squeue", "-u", user, "-o", format, "--noheader"}, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
 	return parseSqueue(out), nil
+}
+
+// FetchJobsSqueue fetches jobs using squeue
+func FetchJobsSqueue() ([]Job, error) {
+	return FetchJobsSqueueContext(context.Background())
 }
 
 func parseSqueue(output string) []Job {
@@ -174,6 +184,10 @@ func parseSqueue(output string) []Job {
 
 // FetchJobsHistory fetches jobs using sacct (N day history)
 func FetchJobsHistory(days int) ([]Job, error) {
+	return FetchJobsHistoryContext(context.Background(), days)
+}
+
+func FetchJobsHistoryContext(ctx context.Context, days int) ([]Job, error) {
 	user := CurrentUser()
 	startTime := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
 
@@ -184,7 +198,7 @@ func FetchJobsHistory(days int) ([]Job, error) {
 		"--starttime", startTime,
 	}
 
-	out, err := RunCommand(args, 30*time.Second)
+	out, err := RunCommandContext(ctx, args, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -234,15 +248,19 @@ func CancelJob(jobID string) error {
 
 // GetJobDetails fetches details for a job
 func GetJobDetails(jobID string, history bool) (string, error) {
+	return GetJobDetailsContext(context.Background(), jobID, history)
+}
+
+func GetJobDetailsContext(ctx context.Context, jobID string, history bool) (string, error) {
 	if history {
 		args := []string{
 			"sacct", "-j", jobID,
 			"--format", "JobID,JobName,User,State,Partition,Elapsed,AllocNodes,NodeList,Start,End,ExitCode",
 			"-P", "-n",
 		}
-		return RunCommand(args, 15*time.Second)
+		return RunCommandContext(ctx, args, 15*time.Second)
 	}
-	return RunCommand([]string{"scontrol", "show", "job", jobID}, 15*time.Second)
+	return RunCommandContext(ctx, []string{"scontrol", "show", "job", jobID}, 15*time.Second)
 }
 
 // ResolveLogPaths finds StdOut and StdErr paths for a job.
@@ -250,8 +268,12 @@ func GetJobDetails(jobID string, history bool) (string, error) {
 // For finished jobs (or if scontrol fails), it prefers direct sacct log fields
 // and only then falls back to submit-line/script heuristics.
 func ResolveLogPaths(jobID string) (string, string, error) {
+	return ResolveLogPathsContext(context.Background(), jobID)
+}
+
+func ResolveLogPathsContext(ctx context.Context, jobID string) (string, string, error) {
 	// Try scontrol first (works for jobs still in slurmctld memory)
-	out, err := RunCommand([]string{"scontrol", "show", "job", jobID}, 10*time.Second)
+	out, err := RunCommandContext(ctx, []string{"scontrol", "show", "job", jobID}, 10*time.Second)
 	if err == nil {
 		stdoutRegex := regexp.MustCompile(`StdOut=(\S+)`)
 		stderrRegex := regexp.MustCompile(`StdErr=(\S+)`)
@@ -277,7 +299,7 @@ func ResolveLogPaths(jobID string) (string, string, error) {
 	// fall back to submit-line/script heuristics and finally WorkDir/slurm-JOBID.out.
 	//
 	// Using -X to get only the main job entry (skip .batch, .extern steps).
-	outSacct, errSacct := RunCommand([]string{"sacct", "-j", jobID, "-o", "WorkDir,JobName,StdOut,StdErr,SubmitLine", "-X", "-n", "-P", "--expand-patterns"}, 5*time.Second)
+	outSacct, errSacct := RunCommandContext(ctx, []string{"sacct", "-j", jobID, "-o", "WorkDir,JobName,StdOut,StdErr,SubmitLine", "-X", "-n", "-P", "--expand-patterns"}, 5*time.Second)
 	if errSacct == nil {
 		if info, ok := parseSacctLogInfo(outSacct); ok {
 			if stdoutPath, stderrPath, ok := resolveSacctLogPaths(info, jobID); ok {

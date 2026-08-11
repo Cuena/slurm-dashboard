@@ -6,7 +6,7 @@ Tested on MareNostrum 5.
 
 ## Features
 
-- Live jobs view from `squeue` (auto refresh every 5 seconds)
+- Live jobs view from `squeue` (auto refresh every 20 seconds, configurable)
 - History mode from `sacct` (default: last 3 days, configurable)
 - Fast filtering by text and status (`All`, `Running`, `Pending`)
 - Job inspection panel (`scontrol` in live mode, `sacct` in history mode)
@@ -69,6 +69,7 @@ Or:
 - `Tab`: switch focus between jobs and details
 - `Ctrl+y`: copy selected detail value
 - `v`: view full selected detail value
+- `a`: toggle curated/all Slurm detail fields
 - `m`: toggle mouse
 - `?`: expanded help
 
@@ -92,12 +93,21 @@ Or:
 
 Copy uses OSC52, so clipboard support depends on your terminal/tmux setup.
 
+In copy mode, drag to select. Keeping the pointer just above or below the log
+pane scrolls while extending the selection. Press `Ctrl+y` to copy and `y` to
+leave copy mode. Copies larger than 100 KiB are explicitly reported as
+truncated because many terminals impose OSC52 limits.
+
 ## Environment Variables
 
 - `SLURM_DASHBOARD_THEME=auto|dark|light`: UI theme selection. `auto` detects the terminal background at startup.
-- `SLURM_DASHBOARD_SURFACES=transparent|solid`: background style (terminal-dependent).
+- `SLURM_DASHBOARD_SURFACES=transparent|solid`: background style (default: `transparent`; terminal-dependent).
 - `SLURM_DASHBOARD_PALETTE=dracula-soft|classic`: color palette.
 - `SLURM_DASHBOARD_HISTORY_DAYS=<positive-integer>` (default: `3`): history window for `sacct` mode.
+- `SLURM_DASHBOARD_LIVE_REFRESH=<duration>` (default: `20s`): `squeue` refresh interval. Plain integers are interpreted as seconds; values below `1s` fall back to the default.
+- `SLURM_DASHBOARD_HISTORY_REFRESH=<duration>` (default: `2m`): `sacct` refresh interval. Values below `5s` fall back to the default.
+- `SLURM_DASHBOARD_DETAILS_DEBOUNCE=<duration>` (default: `300ms`): delay before fetching details after selection changes, preventing command bursts while navigating.
+- `SLURM_DASHBOARD_MAX_LOG_LINES=<integer>` (default: `20000`, minimum: `1000`): retained lines per log pane. Increase this for longer in-app history, with a corresponding memory/rendering cost.
 - `SLURM_DASHBOARD_LOG_ARCHIVE_DIR=/path/to/log/archive`
   - Used for the "archive convention" fallback when Slurm metadata is missing for old jobs.
   - Default (if unset): `~/.slurm-dashboard/logs` (often private to you).

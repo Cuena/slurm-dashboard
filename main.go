@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -22,14 +24,19 @@ import (
 )
 
 const (
-	refreshInterval      = 5 * time.Second
-	panelGap             = 2 // Slightly smaller gap looks cleaner
-	defaultHistoryDays   = 3
-	envHistoryDays       = "SLURM_DASHBOARD_HISTORY_DAYS"
-	panelChromeWidth     = 8
-	minTablePanelWidth   = 30
-	minDetailsPanelWidth = 20
-	maxDetailsPanelWidth = 50
+	defaultLiveRefresh     = 20 * time.Second
+	defaultHistoryRefresh  = 2 * time.Minute
+	defaultDetailsDebounce = 300 * time.Millisecond
+	panelGap               = 2 // Slightly smaller gap looks cleaner
+	defaultHistoryDays     = 3
+	envHistoryDays         = "SLURM_DASHBOARD_HISTORY_DAYS"
+	envLiveRefresh         = "SLURM_DASHBOARD_LIVE_REFRESH"
+	envHistoryRefresh      = "SLURM_DASHBOARD_HISTORY_REFRESH"
+	envDetailsDebounce     = "SLURM_DASHBOARD_DETAILS_DEBOUNCE"
+	panelChromeWidth       = 8
+	minTablePanelWidth     = 30
+	minDetailsPanelWidth   = 20
+	maxDetailsPanelWidth   = 72
 )
 
 const (
@@ -127,57 +134,59 @@ func truncateTableValue(s string, max int) string {
 
 // KeyMap defines the keybindings
 type KeyMap struct {
-	Quit         key.Binding
-	CancelJob    key.Binding
-	InspectJob   key.Binding
-	TailLogs     key.Binding
-	TailStdout   key.Binding // New
-	TailStderr   key.Binding // New
-	Filter       key.Binding
-	Pause        key.Binding
-	Refresh      key.Binding
-	History      key.Binding
-	StatusFilter key.Binding
-	CopyValue    key.Binding
-	ViewValue    key.Binding
-	Up           key.Binding
-	Down         key.Binding
-	Enter        key.Binding
-	SwitchFocus  key.Binding
-	ToggleMouse  key.Binding
-	ToggleHelp   key.Binding
+	Quit          key.Binding
+	CancelJob     key.Binding
+	InspectJob    key.Binding
+	TailLogs      key.Binding
+	TailStdout    key.Binding // New
+	TailStderr    key.Binding // New
+	Filter        key.Binding
+	Pause         key.Binding
+	Refresh       key.Binding
+	History       key.Binding
+	StatusFilter  key.Binding
+	CopyValue     key.Binding
+	ViewValue     key.Binding
+	Up            key.Binding
+	Down          key.Binding
+	Enter         key.Binding
+	SwitchFocus   key.Binding
+	ToggleMouse   key.Binding
+	ToggleDetails key.Binding
+	ToggleHelp    key.Binding
 }
 
 var keys = KeyMap{
-	Quit:         key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
-	CancelJob:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "cancel")),
-	InspectJob:   key.NewBinding(key.WithKeys("i", "enter"), key.WithHelp("i/ent", "inspect")),
-	TailLogs:     key.NewBinding(key.WithKeys("l", "L"), key.WithHelp("l", "tail logs")),
-	TailStdout:   key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "stdout")),
-	TailStderr:   key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "stderr")),
-	Filter:       key.NewBinding(key.WithKeys("f", "/"), key.WithHelp("f", "filter")),
-	Pause:        key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause")),
-	Refresh:      key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-	History:      key.NewBinding(key.WithKeys("h"), key.WithHelp("h", "history")),
-	StatusFilter: key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "status filter")),
-	CopyValue:    key.NewBinding(key.WithKeys("ctrl+y"), key.WithHelp("^y", "copy detail")),
-	ViewValue:    key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "view value")),
-	Up:           key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
-	Down:         key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
-	SwitchFocus:  key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch focus")),
-	ToggleMouse:  key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "toggle mouse")),
-	ToggleHelp:   key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "more keys")),
+	Quit:          key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+	CancelJob:     key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "cancel")),
+	InspectJob:    key.NewBinding(key.WithKeys("i", "enter"), key.WithHelp("i/ent", "inspect")),
+	TailLogs:      key.NewBinding(key.WithKeys("l", "L"), key.WithHelp("l", "tail logs")),
+	TailStdout:    key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "stdout")),
+	TailStderr:    key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "stderr")),
+	Filter:        key.NewBinding(key.WithKeys("f", "/"), key.WithHelp("f", "filter")),
+	Pause:         key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pause")),
+	Refresh:       key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+	History:       key.NewBinding(key.WithKeys("h"), key.WithHelp("h", "history")),
+	StatusFilter:  key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "status filter")),
+	CopyValue:     key.NewBinding(key.WithKeys("ctrl+y"), key.WithHelp("^y", "copy detail")),
+	ViewValue:     key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "view value")),
+	Up:            key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
+	Down:          key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
+	SwitchFocus:   key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "switch focus")),
+	ToggleMouse:   key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "toggle mouse")),
+	ToggleDetails: key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "all fields")),
+	ToggleHelp:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "more keys")),
 }
 
 func (k KeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Quit, k.Filter, k.Refresh, k.InspectJob, k.TailLogs, k.TailStdout, k.TailStderr, k.SwitchFocus, k.ToggleMouse, k.ToggleHelp}
+	return []key.Binding{k.Quit, k.Filter, k.InspectJob, k.TailLogs, k.ToggleHelp}
 }
 
 func (k KeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.InspectJob, k.CancelJob},
 		{k.Filter, k.StatusFilter, k.History, k.Refresh},
-		{k.TailLogs, k.TailStdout, k.TailStderr, k.CopyValue, k.ViewValue, k.SwitchFocus, k.ToggleMouse, k.ToggleHelp, k.Pause, k.Quit},
+		{k.TailLogs, k.TailStdout, k.TailStderr, k.CopyValue, k.ViewValue, k.ToggleDetails, k.SwitchFocus, k.ToggleMouse, k.ToggleHelp, k.Pause, k.Quit},
 	}
 }
 
@@ -201,10 +210,16 @@ type detailsMsg struct {
 type errMsg error
 type refreshNowMsg struct{}
 type tailPathsMsg struct {
+	requestID      int
 	jobID          string
 	stdout, stderr string
 	mode           TailMode
 	err            error
+}
+type detailsDebounceMsg struct {
+	requestID int
+	jobID     string
+	history   bool
 }
 
 // Model is the main application model
@@ -220,6 +235,7 @@ type Model struct {
 	inDetailsOverlay bool
 	// Full-screen single value view (for long detail values).
 	inValueOverlay bool
+	showAllDetails bool
 	valueView      viewport.Model
 	valueKey       string
 	valueValue     string
@@ -234,11 +250,14 @@ type Model struct {
 	confirmingCancel bool
 	cancelCandidate  *Job
 
-	appMode     mode
-	paused      bool
-	sFilter     statusFilter
-	loadingJobs bool
-	historyDays int
+	appMode         mode
+	paused          bool
+	sFilter         statusFilter
+	loadingJobs     bool
+	historyDays     int
+	liveRefresh     time.Duration
+	historyRefresh  time.Duration
+	detailsDebounce time.Duration
 
 	width  int
 	height int
@@ -268,8 +287,12 @@ type Model struct {
 	copyFeedback       string
 	copyFeedbackExpiry time.Time
 
-	jobsRequestID    int
-	detailsRequestID int
+	jobsRequestID      int
+	detailsRequestID   int
+	tailPathsRequestID int
+	jobsCancel         context.CancelFunc
+	detailsCancel      context.CancelFunc
+	tailPathsCancel    context.CancelFunc
 }
 
 func NewModel() Model {
@@ -323,16 +346,19 @@ func NewModel() Model {
 	ti.Cursor.Style = lipgloss.NewStyle().Foreground(focusBorder)
 
 	m := Model{
-		table:         t,
-		detailsTable:  dt,
-		filterInput:   ti,
-		help:          help.New(),
-		appMode:       modeLive,
-		sFilter:       filterAll,
-		fullColumns:   columns,
-		mouseEnabled:  false,
-		historyDays:   historyDaysFromEnv(),
-		jobsRequestID: 1,
+		table:           t,
+		detailsTable:    dt,
+		filterInput:     ti,
+		help:            help.New(),
+		appMode:         modeLive,
+		sFilter:         filterAll,
+		fullColumns:     columns,
+		mouseEnabled:    false,
+		historyDays:     historyDaysFromEnv(),
+		liveRefresh:     durationFromEnv(envLiveRefresh, defaultLiveRefresh, time.Second),
+		historyRefresh:  durationFromEnv(envHistoryRefresh, defaultHistoryRefresh, 5*time.Second),
+		detailsDebounce: durationFromEnv(envDetailsDebounce, defaultDetailsDebounce, 0),
+		jobsRequestID:   1,
 	}
 
 	m.help.ShortSeparator = "·"
@@ -354,7 +380,7 @@ func NewModel() Model {
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
-		m.fetchJobsCmd(),
+		m.fetchJobsCmd(context.Background()),
 		m.tickCmd(),
 		initialWindowSizeCmd(),
 	)
@@ -490,6 +516,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Batch(cmds...)
 				}
 			}
+			if key.Matches(msg, keys.ToggleDetails) {
+				m.toggleDetailsMode()
+				return m, nil
+			}
 			// In overlay mode, treat Esc/q/i as "close overlay" instead of quitting.
 			switch msg.String() {
 			case "esc", "q", "i":
@@ -613,8 +643,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.jobs = msg.jobs
 		m.lastRefresh = time.Now()
-		m.err = nil
 		m.loadingJobs = false
+		m.err = nil
 		m.updateTable()
 
 		// Sync selection immediately
@@ -633,7 +663,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshSelectedDetails = false
 
 	case jobsErrMsg:
-		if msg.requestID != m.jobsRequestID || msg.mode != m.appMode {
+		if msg.requestID != m.jobsRequestID || msg.mode != m.appMode || errors.Is(msg.err, context.Canceled) {
 			break
 		}
 		m.err = msg.err
@@ -646,7 +676,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rawDetails = msg.text
 		m.updateDetailsTable(m.rawDetails)
 
+	case detailsDebounceMsg:
+		if msg.requestID != m.detailsRequestID || msg.jobID != m.selectedID || msg.history != (m.appMode == modeHistory) {
+			break
+		}
+		cmds = append(cmds, m.startDetailsFetchCmd(msg.jobID, msg.requestID, msg.history))
+
 	case tailPathsMsg:
+		if msg.requestID != m.tailPathsRequestID {
+			break
+		}
 		// Use the job ID associated with the request; selection may have
 		// changed while paths were resolving.
 		if msg.jobID != "" {
@@ -767,19 +806,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Provide feedback in details table immediately
 					m.detailsTable.SetRows([]table.Row{{"Status", "Resolving logs..."}})
 					// Trigger the command
-					cmds = append(cmds, m.resolveTailPathsCmd(job.JobID, TailModeBoth))
+					cmds = append(cmds, m.queueTailPathsCmd(job.JobID, TailModeBoth))
 				}
 			case key.Matches(msg, keys.TailStdout):
 				job := m.getSelectedJob()
 				if job != nil {
 					m.detailsTable.SetRows([]table.Row{{"Status", "Resolving stdout..."}})
-					cmds = append(cmds, m.resolveTailPathsCmd(job.JobID, TailModeStdout))
+					cmds = append(cmds, m.queueTailPathsCmd(job.JobID, TailModeStdout))
 				}
 			case key.Matches(msg, keys.TailStderr):
 				job := m.getSelectedJob()
 				if job != nil {
 					m.detailsTable.SetRows([]table.Row{{"Status", "Resolving stderr..."}})
-					cmds = append(cmds, m.resolveTailPathsCmd(job.JobID, TailModeStderr))
+					cmds = append(cmds, m.queueTailPathsCmd(job.JobID, TailModeStderr))
 				}
 			case key.Matches(msg, keys.SwitchFocus):
 				if m.hideDetails {
@@ -816,6 +855,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, cmd)
 					return m, tea.Batch(cmds...)
 				}
+			case key.Matches(msg, keys.ToggleDetails):
+				m.toggleDetailsMode()
+				return m, nil
 			}
 		}
 	}
@@ -842,11 +884,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+func (m *Model) toggleDetailsMode() {
+	if strings.TrimSpace(m.rawDetails) == "" || m.appMode == modeHistory {
+		return
+	}
+	m.showAllDetails = !m.showAllDetails
+	m.updateDetailsTable(m.rawDetails)
+	m.detailsTable.SetCursor(0)
+	m.applyPanelHeights()
+}
+
 func (m Model) View() string {
 	if m.inTailView {
+		footer := m.help.View(tailKeys)
+		if m.tailModel.InCopyMode() {
+			footer = m.tailModel.CopyFooterView()
+		}
 		return lipgloss.JoinVertical(lipgloss.Left,
 			m.tailModel.View(),
-			m.help.View(tailKeys),
+			footer,
 		)
 	}
 
@@ -912,19 +968,19 @@ func (m Model) renderHeaderArea() string {
 		toolbarBrandStyle.Render("slurm"),
 		modeTabs,
 		filterBoxStyle.Render(m.filterInput.View()),
-		toolbarDividerStyle.Render("|"),
-		toolbarMetaStyle.Render(fmt.Sprintf("jobs %d", len(m.filtered))),
-		toolbarMetaStyle.Render("focus " + focusTarget),
 	}
-	optional := []string{}
+	optional := []string{toolbarMetaStyle.Render(fmt.Sprintf("%d jobs", len(m.filtered)))}
+	if compact := m.jobStatsCompactPill(); compact != "" {
+		optional = append(optional, compact)
+	}
+	if focusTarget != "jobs" {
+		optional = append(optional, toolbarMetaStyle.Render("focus "+focusTarget))
+	}
 	if m.sFilter != filterAll {
 		optional = append(optional, toolbarMetaStyle.Render("state "+strings.ToLower(m.sFilter.String())))
 	}
 	if query := strings.TrimSpace(m.filterInput.Value()); query != "" {
 		optional = append(optional, toolbarMetaStyle.Render("find "+trimDetailValueToWidth(query, 18)))
-	}
-	if compact := m.jobStatsCompactPill(); compact != "" {
-		optional = append(optional, compact)
 	}
 	if !m.lastRefresh.IsZero() {
 		optional = append(optional, toolbarMetaStyle.Render("updated "+m.lastRefresh.Format("15:04:05")))
@@ -967,25 +1023,32 @@ func (m Model) tablePanelTitle() string {
 func (m Model) jobStatsCompactPill() string {
 	stats := m.collectJobStats()
 	parts := []string{}
+	label := func(long, short string, count int, color lipgloss.TerminalColor) string {
+		name := short
+		if m.width >= 120 {
+			name = long
+		}
+		return lipgloss.NewStyle().Foreground(color).Bold(true).Render(fmt.Sprintf("%s %d", name, count))
+	}
 	if stats.Running > 0 {
-		parts = append(parts, fmt.Sprintf("R%d", stats.Running))
+		parts = append(parts, label("running", "R", stats.Running, accentGreen))
 	}
 	if stats.Pending > 0 {
-		parts = append(parts, fmt.Sprintf("P%d", stats.Pending))
+		parts = append(parts, label("pending", "P", stats.Pending, accentOrange))
 	}
 	if stats.Failed > 0 {
-		parts = append(parts, fmt.Sprintf("F%d", stats.Failed))
+		parts = append(parts, label("failed", "F", stats.Failed, danger))
 	}
 	if stats.Completed > 0 {
-		parts = append(parts, fmt.Sprintf("C%d", stats.Completed))
+		parts = append(parts, label("complete", "C", stats.Completed, accentBlue))
 	}
 	if stats.Other > 0 {
-		parts = append(parts, fmt.Sprintf("O%d", stats.Other))
+		parts = append(parts, label("other", "O", stats.Other, subtle))
 	}
 	if len(parts) == 0 {
 		return ""
 	}
-	return toolbarMetaStyle.Render(strings.Join(parts, " "))
+	return strings.Join(parts, "  ")
 }
 
 func (m Model) renderTablePanel() string {
@@ -1096,6 +1159,14 @@ func (m Model) renderJobsTable() string {
 				if isSelected {
 					style = selectedStyle
 				}
+				if colIdx == 0 && isSelected {
+					style = style.Copy().Foreground(focusBorder).Bold(true)
+				}
+				if colIdx == 2 {
+					code := StateCode(value)
+					value = "● " + code
+					style = style.Copy().Foreground(statusColor(code)).Bold(true)
+				}
 				cells = append(cells, renderJobsTableCell(value, col.Width, style))
 			}
 			body = append(body, lipgloss.JoinHorizontal(lipgloss.Top, cells...))
@@ -1128,9 +1199,15 @@ func (m Model) detailsPanelTitle() string {
 	}
 	if m.detailsTable.Focused() {
 		parts = append(parts, focusTagStyle.Render("focus"))
-	} else if m.getSelectedJob() != nil {
-		parts = append(parts, panelMetaStyle.Render("tab scroll"))
 	}
+	modeHint := "history fields"
+	if m.appMode != modeHistory {
+		modeHint = "a all fields"
+		if m.showAllDetails {
+			modeHint = "a summary"
+		}
+	}
+	parts = append(parts, panelMetaStyle.Render(modeHint))
 	return joinWithGap(parts, 1)
 }
 
@@ -1431,6 +1508,13 @@ func (m Model) buildDetailInspector() (string, int) {
 	contentWidth := m.detailsContentWidth
 
 	copyMessage := detailInspectorHintText(contentWidth)
+	if contentWidth >= 40 && m.appMode != modeHistory {
+		if m.showAllDetails {
+			copyMessage += "  •  a summary"
+		} else {
+			copyMessage += "  •  a all fields"
+		}
+	}
 	copyStyle := copyHintStyle
 	if m.copyFeedback != "" {
 		copyMessage = m.copyFeedback
@@ -1464,24 +1548,29 @@ func (m Model) buildSelectedJobSummary() (string, int) {
 	}
 
 	fields := detailRowsToMap(m.detailsTable.Rows())
-	parts := []string{
-		renderDetailSummaryMetric("state", renderStateBadge(job.State(), job.Status)),
-		renderDetailSummaryMetric("name", trimDetailValueToWidth(job.Name, 28)),
-	}
+	headline := joinWithGap([]string{
+		renderStateBadge(job.State(), job.Status),
+		detailSummaryValueStyle.Render(trimDetailValueToWidth(job.Name, 34)),
+	}, 1)
+	meta := []string{}
 	if job.Partition != "" {
-		parts = append(parts, renderDetailSummaryMetric("partition", job.Partition))
+		meta = append(meta, detailSummaryLabelStyle.Render("partition ")+detailSummaryValueStyle.Render(job.Partition))
 	}
 	if job.Nodes != "" {
-		parts = append(parts, renderDetailSummaryMetric("nodes", job.Nodes))
+		meta = append(meta, detailSummaryLabelStyle.Render("nodes ")+detailSummaryValueStyle.Render(job.Nodes))
 	}
 	if job.Time != "" {
-		parts = append(parts, renderDetailSummaryMetric("time", job.Time))
+		meta = append(meta, detailSummaryLabelStyle.Render("time ")+detailSummaryValueStyle.Render(job.Time))
+	}
+	lines := []string{headline}
+	if len(meta) > 0 {
+		lines = append(lines, wrapSegments(meta, m.detailsContentWidth, 2))
 	}
 	if reason := firstDetailValue(fields, "PendingReason", "Reason"); reason != "" && !isUnknownDetailValue(reason) && job.IsPending() {
-		parts = append(parts, renderDetailSummaryMetric("reason", trimDetailValueToWidth(reason, 24)))
+		lines = append(lines, lipgloss.NewStyle().Foreground(accentOrange).Render("waiting: "+trimDetailValueToWidth(reason, 40)))
 	}
 
-	summary := wrapSegments(parts, m.detailsContentWidth, 1)
+	summary := lipgloss.JoinVertical(lipgloss.Left, lines...)
 	style := detailSummaryStyle.Copy()
 	if m.detailsContentWidth > 0 {
 		style = style.Width(m.detailsContentWidth)
@@ -1504,7 +1593,7 @@ func detailInspectorHintText(width int) string {
 func detailsOverlayHintText(width int) string {
 	switch {
 	case width >= 56:
-		return "Esc/q/i close  •  v view full value  •  Ctrl+Y copy"
+		return "Esc/q/i close  •  a summary/all  •  v view full  •  Ctrl+Y copy"
 	case width >= 34:
 		return "Esc/q/i close  •  v view  •  ^Y copy"
 	default:
@@ -1685,8 +1774,9 @@ func (m *Model) applyWindowSize(width, height int) {
 		m.detailsPanelHeight = availableHeight - m.tablePanelHeight
 		m.stackGapHeight = 1
 	} else {
-		// Set Table to 60%
-		tableBlockWidth = (usable * 60) / 100
+		// Give structured details enough room on wide terminals without
+		// compromising the jobs table.
+		tableBlockWidth = (usable * 65) / 100
 
 		if tableBlockWidth < minTablePanelWidth {
 			tableBlockWidth = minTablePanelWidth
@@ -1947,19 +2037,6 @@ func wrapSegments(parts []string, width, gap int) string {
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
-func renderDetailSummaryMetric(label, value string) string {
-	if strings.TrimSpace(value) == "" {
-		return ""
-	}
-	return summaryChipStyle.Render(
-		lipgloss.JoinHorizontal(
-			lipgloss.Left,
-			detailSummaryLabelStyle.Render(label),
-			lipgloss.NewStyle().MarginLeft(1).Render(detailSummaryValueStyle.Render(value)),
-		),
-	)
-}
-
 func renderStateBadge(state, label string) string {
 	code := strings.ToUpper(strings.TrimSpace(state))
 	if code == "" && label != "" {
@@ -1971,7 +2048,7 @@ func renderStateBadge(state, label string) string {
 		caption = strings.ToUpper(code)
 	} else {
 		caption = strings.ToUpper(caption)
-		if code != "" {
+		if code != "" && StateCode(caption) != code {
 			caption = fmt.Sprintf("%s (%s)", caption, code)
 		}
 	}
@@ -2002,8 +2079,64 @@ func (m *Model) updateDetailsTable(text string) {
 		rows = parseHistoryDetailsToRows(text)
 	} else {
 		rows = parseDetailsToRows(text)
+		if !m.showAllDetails {
+			rows = curatedDetailRows(rows)
+		}
 	}
 	m.detailsTable.SetRows(rows)
+}
+
+func curatedDetailRows(rows []table.Row) []table.Row {
+	if len(rows) == 0 || (len(rows) == 1 && (rows[0][0] == "Error" || rows[0][0] == "Info")) {
+		return rows
+	}
+	fields := detailRowsToMap(rows)
+	curated := make([]table.Row, 0, 24)
+	appendField := func(label string, keepUnknown bool, keys ...string) {
+		value := firstDetailValue(fields, keys...)
+		if value == "" || (!keepUnknown && isUnknownDetailValue(value)) {
+			return
+		}
+		curated = append(curated, table.Row{label, value})
+	}
+
+	// Operational state and scheduling: the questions most often asked while
+	// watching jobs on a cluster.
+	appendField("Reason", true, "Reason")
+	appendField("Priority", false, "Priority")
+	appendField("QOS", false, "QOS")
+	appendField("Account", false, "Account")
+	appendField("Submitted", false, "SubmitTime")
+	appendField("Eligible", false, "EligibleTime")
+	appendField("Started", false, "StartTime")
+	appendField("Last evaluated", false, "LastSchedEval")
+	appendField("Deadline", false, "Deadline")
+	appendField("Runtime", false, "RunTime", "Elapsed")
+	appendField("Time limit", false, "TimeLimit")
+	appendField("Exit code", false, "ExitCode")
+
+	// Requested and allocated resources.
+	appendField("Tasks", false, "NumTasks")
+	appendField("CPUs", false, "NumCPUs")
+	appendField("CPUs/task", false, "CPUs/Task", "CPUsPerTask")
+	appendField("Requested TRES", false, "ReqTRES", "TresPerJob")
+	appendField("Allocated TRES", false, "AllocTRES")
+	appendField("Node list", false, "NodeList")
+	appendField("Batch host", false, "BatchHost")
+	appendField("Features", false, "Features")
+	appendField("GRES", false, "Gres", "GRES")
+
+	// Identity and file locations are useful for debugging and log recovery.
+	appendField("User", false, "UserId", "User")
+	appendField("Work directory", false, "WorkDir")
+	appendField("Command", false, "Command")
+	appendField("Stdout", false, "StdOut")
+	appendField("Stderr", false, "StdErr")
+
+	if len(curated) == 0 {
+		return rows
+	}
+	return curated
 }
 
 var detailKeyPattern = regexp.MustCompile(`(?:^|\s)([A-Za-z][A-Za-z0-9_.:/-]*)=`)
@@ -2018,7 +2151,7 @@ func parseDetailsToRows(text string) []table.Row {
 	if len(rows) == 0 {
 		return []table.Row{{"Info", "No details found"}}
 	}
-	return prependPendingInsightRows(rows)
+	return rows
 }
 
 func parseScontrolDetailsRows(text string) []table.Row {
@@ -2055,38 +2188,6 @@ func parseScontrolDetailsRows(text string) []table.Row {
 	return rows
 }
 
-func prependPendingInsightRows(rows []table.Row) []table.Row {
-	fields := detailRowsToMap(rows)
-	state := firstDetailValue(fields, "JobState", "State")
-	if !isPendingStateLabel(state) {
-		return rows
-	}
-
-	summary := []table.Row{}
-	appendPendingField := func(label string, skipUnknown bool, keys ...string) {
-		value := firstDetailValue(fields, keys...)
-		if value == "" {
-			return
-		}
-		if skipUnknown && isUnknownDetailValue(value) {
-			return
-		}
-		summary = append(summary, table.Row{label, value})
-	}
-
-	appendPendingField("PendingReason", false, "Reason")
-	appendPendingField("ExpectedStart", true, "StartTime")
-	appendPendingField("EligibleTime", true, "EligibleTime")
-	appendPendingField("SubmitTime", true, "SubmitTime")
-	appendPendingField("Priority", false, "Priority")
-
-	if len(summary) == 0 {
-		return rows
-	}
-
-	return append(summary, rows...)
-}
-
 func detailRowsToMap(rows []table.Row) map[string]string {
 	fields := make(map[string]string, len(rows))
 	for _, row := range rows {
@@ -2112,16 +2213,6 @@ func firstDetailValue(fields map[string]string, keys ...string) string {
 		}
 	}
 	return ""
-}
-
-func isPendingStateLabel(state string) bool {
-	code := StateCode(state)
-	switch code {
-	case "PD", "CF", "PR", "RQ", "RS", "S", "ST", "RH", "RF":
-		return true
-	default:
-		return false
-	}
 }
 
 func isUnknownDetailValue(value string) bool {
@@ -2298,7 +2389,14 @@ func (m *Model) updateTable() {
 // --- Commands ---
 
 func (m Model) tickCmd() tea.Cmd {
-	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg {
+	interval := m.liveRefresh
+	if m.appMode == modeHistory {
+		interval = m.historyRefresh
+	}
+	if interval <= 0 {
+		interval = defaultLiveRefresh
+	}
+	return tea.Tick(interval, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
@@ -2331,19 +2429,38 @@ func historyDaysFromEnv() int {
 	return days
 }
 
-func (m Model) fetchJobsCmd() tea.Cmd {
+func durationFromEnv(name string, fallback, minimum time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		seconds, parseErr := strconv.Atoi(raw)
+		if parseErr != nil {
+			return fallback
+		}
+		value = time.Duration(seconds) * time.Second
+	}
+	if value < minimum {
+		return fallback
+	}
+	return value
+}
+
+func (m Model) fetchJobsCmd(ctx context.Context) tea.Cmd {
 	requestID := m.jobsRequestID
 	requestMode := m.appMode
 	historyDays := m.historyDays
 	return func() tea.Msg {
 		if requestMode == modeHistory {
-			jobs, err := FetchJobsHistory(historyDays)
+			jobs, err := FetchJobsHistoryContext(ctx, historyDays)
 			if err != nil {
 				return jobsErrMsg{requestID: requestID, mode: requestMode, err: err}
 			}
 			return jobsMsg{requestID: requestID, mode: requestMode, jobs: jobs}
 		}
-		jobs, err := FetchJobsSqueue()
+		jobs, err := FetchJobsSqueueContext(ctx)
 		if err != nil {
 			return jobsErrMsg{requestID: requestID, mode: requestMode, err: err}
 		}
@@ -2351,11 +2468,9 @@ func (m Model) fetchJobsCmd() tea.Cmd {
 	}
 }
 
-func (m Model) fetchDetailsCmd(id string) tea.Cmd {
-	requestID := m.detailsRequestID
-	history := m.appMode == modeHistory
+func (m Model) fetchDetailsCmd(ctx context.Context, id string, requestID int, history bool) tea.Cmd {
 	return func() tea.Msg {
-		det, err := GetJobDetails(id, history)
+		det, err := GetJobDetailsContext(ctx, id, history)
 		if err != nil {
 			return detailsMsg{
 				requestID: requestID,
@@ -2369,13 +2484,38 @@ func (m Model) fetchDetailsCmd(id string) tea.Cmd {
 }
 
 func (m *Model) queueJobsFetchCmd() tea.Cmd {
+	if m.jobsCancel != nil {
+		m.jobsCancel()
+	}
 	m.jobsRequestID++
-	return m.fetchJobsCmd()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.jobsCancel = cancel
+	return m.fetchJobsCmd(ctx)
 }
 
 func (m *Model) queueDetailsFetchCmd(id string) tea.Cmd {
+	if m.detailsCancel != nil {
+		m.detailsCancel()
+		m.detailsCancel = nil
+	}
 	m.detailsRequestID++
-	return m.fetchDetailsCmd(id)
+	requestID := m.detailsRequestID
+	history := m.appMode == modeHistory
+	if m.detailsDebounce <= 0 {
+		return m.startDetailsFetchCmd(id, requestID, history)
+	}
+	return tea.Tick(m.detailsDebounce, func(time.Time) tea.Msg {
+		return detailsDebounceMsg{requestID: requestID, jobID: id, history: history}
+	})
+}
+
+func (m *Model) startDetailsFetchCmd(id string, requestID int, history bool) tea.Cmd {
+	if m.detailsCancel != nil {
+		m.detailsCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.detailsCancel = cancel
+	return m.fetchDetailsCmd(ctx, id, requestID, history)
 }
 
 func (m Model) cancelJobCmd(id string) tea.Cmd {
@@ -2388,20 +2528,30 @@ func (m Model) cancelJobCmd(id string) tea.Cmd {
 	}
 }
 
-func (m Model) resolveTailPathsCmd(id string, mode TailMode) tea.Cmd {
+func (m Model) resolveTailPathsCmd(ctx context.Context, id string, mode TailMode, requestID int) tea.Cmd {
 	return func() tea.Msg {
-		out, errPath, errExec := ResolveLogPaths(id)
+		out, errPath, errExec := ResolveLogPathsContext(ctx, id)
 
 		// If resolution failed entirely, return empty paths
 		// The tail view will show "No path provided" for empty paths
 		if errExec != nil {
 			// Return empty paths - the tail view handles this gracefully. We
 			// also propagate the error so the header can show it.
-			return tailPathsMsg{jobID: id, stdout: "", stderr: "", mode: mode, err: errExec}
+			return tailPathsMsg{requestID: requestID, jobID: id, stdout: "", stderr: "", mode: mode, err: errExec}
 		}
 
-		return tailPathsMsg{jobID: id, stdout: out, stderr: errPath, mode: mode}
+		return tailPathsMsg{requestID: requestID, jobID: id, stdout: out, stderr: errPath, mode: mode}
 	}
+}
+
+func (m *Model) queueTailPathsCmd(id string, mode TailMode) tea.Cmd {
+	if m.tailPathsCancel != nil {
+		m.tailPathsCancel()
+	}
+	m.tailPathsRequestID++
+	ctx, cancel := context.WithCancel(context.Background())
+	m.tailPathsCancel = cancel
+	return m.resolveTailPathsCmd(ctx, id, mode, m.tailPathsRequestID)
 }
 
 func main() {

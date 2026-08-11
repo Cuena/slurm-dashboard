@@ -82,12 +82,6 @@ var (
 			Padding(0, 1).
 			Bold(true)
 
-	summaryChipStyle = lipgloss.NewStyle().
-				Background(panelBg).
-				Padding(0, 1).
-				Align(lipgloss.Left).
-				MarginRight(1)
-
 	// Main panels
 	listStyle = lipgloss.NewStyle().
 			Border(panelBorderShape()).
@@ -103,11 +97,13 @@ var (
 
 	panelTitleStyle = lipgloss.NewStyle().
 			Foreground(textStrong).
+			Background(panelBg).
 			Bold(true).
 			MarginBottom(0)
 
 	panelMetaStyle = lipgloss.NewStyle().
-			Foreground(subtle)
+			Foreground(subtle).
+			Background(panelBg)
 
 	detailSummaryStyle = lipgloss.NewStyle().
 				Background(panelBgAccent).
@@ -115,17 +111,20 @@ var (
 				MarginBottom(1)
 
 	detailSummaryLabelStyle = lipgloss.NewStyle().
-				Foreground(subtle)
+				Foreground(subtle).
+				Background(panelBgAccent)
 
 	detailSummaryValueStyle = lipgloss.NewStyle().
 				Foreground(textStrong).
+				Background(panelBgAccent).
 				Bold(true)
 
 	detailInspectorStyle = lipgloss.NewStyle().
 				PaddingTop(1)
 
 	copyHintStyle = lipgloss.NewStyle().
-			Foreground(subtle)
+			Foreground(subtle).
+			Background(panelBgAccent)
 
 	copyStatusStyle = lipgloss.NewStyle().
 			Foreground(accentGreen).
@@ -133,6 +132,7 @@ var (
 
 	placeholderStyle = lipgloss.NewStyle().
 				Foreground(subtle).
+				Background(panelBg).
 				Italic(true)
 
 	dialogStyle = lipgloss.NewStyle().
@@ -146,23 +146,23 @@ var (
 	// Table Styles
 	tableHeaderStyle = lipgloss.NewStyle().
 				Foreground(subtle).
+				Background(panelBg).
 				Bold(true).
 				Align(lipgloss.Left).
 				Padding(0, 1)
 
 	tableCellStyle = lipgloss.NewStyle().
 			Foreground(textStrong).
+			Background(panelBg).
 			Padding(0, 1)
 
 	jobsTableSelectedCellStyle = tableCellStyle.Copy().
-					Foreground(textOnAccent).
-					Background(accentFill).
-					Bold(true)
+					Foreground(textStrong).
+					Background(selectionBg)
 
 	jobsTableSelectedMutedCellStyle = tableCellStyle.Copy().
 					Foreground(textStrong).
-					Background(selectionBg).
-					Bold(true)
+					Background(panelBgAccent)
 
 	statusBadgeStyle = lipgloss.NewStyle().
 				Padding(0, 1).

@@ -2,9 +2,9 @@ package main
 
 import (
 	"errors"
-	"testing"
-
 	"github.com/charmbracelet/bubbles/table"
+	"testing"
+	"time"
 )
 
 func TestParseDetailsToRowsPreservesValuesWithSpaces(t *testing.T) {
@@ -21,20 +21,20 @@ func TestParseDetailsToRowsPreservesValuesWithSpaces(t *testing.T) {
 	}
 }
 
-func TestParseDetailsToRowsPrependsPendingInsight(t *testing.T) {
+func TestCuratedDetailsPrioritizePendingInsight(t *testing.T) {
 	input := "JobId=456 JobName=train JobState=PENDING Reason=Resources StartTime=2026-03-10T15:00:00 EligibleTime=2026-03-10T14:30:00 SubmitTime=2026-03-10T14:00:00 Priority=12345 Partition=gpu"
 
-	rows := parseDetailsToRows(input)
+	rows := curatedDetailRows(parseDetailsToRows(input))
 	if len(rows) < 5 {
 		t.Fatalf("expected pending summary rows to be prepended, got %d rows", len(rows))
 	}
 
 	want := []tableExpectation{
-		{key: "PendingReason", value: "Resources"},
-		{key: "ExpectedStart", value: "2026-03-10T15:00:00"},
-		{key: "EligibleTime", value: "2026-03-10T14:30:00"},
-		{key: "SubmitTime", value: "2026-03-10T14:00:00"},
+		{key: "Reason", value: "Resources"},
 		{key: "Priority", value: "12345"},
+		{key: "Submitted", value: "2026-03-10T14:00:00"},
+		{key: "Eligible", value: "2026-03-10T14:30:00"},
+		{key: "Started", value: "2026-03-10T15:00:00"},
 	}
 
 	for i, expected := range want {
@@ -154,6 +154,97 @@ func TestSelectedJobUsesFilteredCursorNotTableRowPosition(t *testing.T) {
 	}
 	if job := m.getSelectedJob(); job == nil || job.JobID != "102" {
 		t.Fatalf("selected job = %+v, want job 102", job)
+	}
+}
+
+func TestModelIgnoresStaleTailPathsResponse(t *testing.T) {
+	m := NewModel()
+	m.tailPathsRequestID = 2
+
+	model, _ := m.Update(tailPathsMsg{
+		requestID: 1,
+		jobID:     "old",
+		stdout:    "/tmp/old.out",
+		mode:      TailModeStdout,
+	})
+	updated := model.(Model)
+	if updated.inTailView {
+		t.Fatalf("expected stale log-path response to be ignored")
+	}
+}
+
+func TestJobsErrorClearsLoadingState(t *testing.T) {
+	m := NewModel()
+	m.appMode = modeHistory
+	m.jobsRequestID = 7
+	m.loadingJobs = true
+
+	model, _ := m.Update(jobsErrMsg{requestID: 7, mode: modeHistory, err: errors.New("sacct unavailable")})
+	updated := model.(Model)
+	if updated.loadingJobs {
+		t.Fatalf("expected matching jobs error to clear loading state")
+	}
+	if updated.err == nil {
+		t.Fatalf("expected matching jobs error to be visible")
+	}
+}
+
+func TestDurationFromEnv(t *testing.T) {
+	t.Setenv("TEST_REFRESH", "45s")
+	if got := durationFromEnv("TEST_REFRESH", time.Minute, time.Second); got != 45*time.Second {
+		t.Fatalf("expected 45s, got %s", got)
+	}
+	t.Setenv("TEST_REFRESH", "30")
+	if got := durationFromEnv("TEST_REFRESH", time.Minute, time.Second); got != 30*time.Second {
+		t.Fatalf("expected integer seconds, got %s", got)
+	}
+}
+
+func TestCuratedDetailsUseOperationalSlurmFields(t *testing.T) {
+	input := "JobId=43169753 JobName=sam3 JobState=PENDING Reason=Priority Priority=107874 QOS=acc_debug Account=bsc70 SubmitTime=2026-07-12T00:26:27 EligibleTime=2026-07-12T00:26:27 RunTime=00:00:00 TimeLimit=02:00:00 NumTasks=4 NumCPUs=16 ReqTRES=cpu=16,mem=64G WorkDir=/gpfs/scratch/run StdOut=/gpfs/scratch/run/job.out Command=/gpfs/scratch/run/job.sh GroupId=bsc(50000)"
+	rows := curatedDetailRows(parseDetailsToRows(input))
+	fields := detailRowsToMap(rows)
+
+	want := map[string]string{
+		"Reason":         "Priority",
+		"Priority":       "107874",
+		"QOS":            "acc_debug",
+		"Runtime":        "00:00:00",
+		"Time limit":     "02:00:00",
+		"Tasks":          "4",
+		"CPUs":           "16",
+		"Requested TRES": "cpu=16,mem=64G",
+		"Work directory": "/gpfs/scratch/run",
+		"Stdout":         "/gpfs/scratch/run/job.out",
+		"Command":        "/gpfs/scratch/run/job.sh",
+	}
+	for key, expected := range want {
+		if got := fields[key]; got != expected {
+			t.Fatalf("curated field %q = %q, want %q", key, got, expected)
+		}
+	}
+	if _, ok := fields["GroupId"]; ok {
+		t.Fatalf("expected low-value raw field to be hidden in curated mode")
+	}
+}
+
+func TestToggleDetailsModeRestoresAllRawFields(t *testing.T) {
+	m := NewModel()
+	m.rawDetails = "JobId=1 JobState=PENDING Reason=Priority GroupId=bsc(50000) Priority=42"
+	m.updateDetailsTable(m.rawDetails)
+	curatedCount := len(m.detailsTable.Rows())
+	m.toggleDetailsMode()
+	if !m.showAllDetails {
+		t.Fatalf("expected all-fields mode")
+	}
+	if got := len(m.detailsTable.Rows()); got <= curatedCount {
+		t.Fatalf("expected all fields to contain more rows: curated=%d all=%d", curatedCount, got)
+	}
+}
+
+func TestTransparentSurfacesAreDefault(t *testing.T) {
+	if got := parseSurfaceMode(""); got != SurfaceTransparent {
+		t.Fatalf("default surface mode = %q, want transparent", got)
 	}
 }
 
