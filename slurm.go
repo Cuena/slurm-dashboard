@@ -271,21 +271,43 @@ func ResolveLogPaths(jobID string) (string, string, error) {
 	return ResolveLogPathsContext(context.Background(), jobID)
 }
 
+type jobDetail struct {
+	key   string
+	value string
+}
+
+var detailKeyPattern = regexp.MustCompile(`(?:^|\s)([A-Za-z][A-Za-z0-9_.:/-]*)=`)
+
+// scontrol values can contain whitespace; the next named field delimits them.
+func parseScontrolDetails(text string) []jobDetail {
+	clean := strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
+	matches := detailKeyPattern.FindAllStringSubmatchIndex(clean, -1)
+	fields := make([]jobDetail, 0, len(matches))
+	for i, match := range matches {
+		end := len(clean)
+		if i+1 < len(matches) {
+			end = matches[i+1][0]
+		}
+		fields = append(fields, jobDetail{
+			key:   clean[match[2]:match[3]],
+			value: strings.TrimSpace(clean[match[1]:end]),
+		})
+	}
+	return fields
+}
+
 func ResolveLogPathsContext(ctx context.Context, jobID string) (string, string, error) {
 	// Try scontrol first (works for jobs still in slurmctld memory)
 	out, err := RunCommandContext(ctx, []string{"scontrol", "show", "job", jobID}, 10*time.Second)
 	if err == nil {
-		stdoutRegex := regexp.MustCompile(`StdOut=(\S+)`)
-		stderrRegex := regexp.MustCompile(`StdErr=(\S+)`)
-
-		stdout := ""
-		if matches := stdoutRegex.FindStringSubmatch(out); len(matches) > 1 {
-			stdout = matches[1]
-		}
-
-		stderr := ""
-		if matches := stderrRegex.FindStringSubmatch(out); len(matches) > 1 {
-			stderr = matches[1]
+		var stdout, stderr string
+		for _, field := range parseScontrolDetails(out) {
+			switch field.key {
+			case "StdOut":
+				stdout = field.value
+			case "StdErr":
+				stderr = field.value
+			}
 		}
 
 		// If we found paths, return them
@@ -403,12 +425,6 @@ func resolveSacctLogPaths(info sacctLogInfo, jobID string) (string, string, bool
 
 	return "", "", false
 }
-
-var (
-	outputFlagRe = regexp.MustCompile(`(?i)(?:^|\s)(-o|--output)\s*=?\s*(\S+)`)
-	errorFlagRe  = regexp.MustCompile(`(?i)(?:^|\s)(-e|--error)\s*=?\s*(\S+)`)
-	chdirFlagRe  = regexp.MustCompile(`(?i)(?:^|\s)(-D|--chdir)\s*=?\s*(\S+)`)
-)
 
 type sbatchDirectives struct {
 	stdout string
@@ -581,14 +597,6 @@ func splitShellWords(text string) []string {
 	return tokens
 }
 
-func parseFlagValue(text string, re *regexp.Regexp) string {
-	matches := re.FindStringSubmatch(text)
-	if len(matches) < 3 {
-		return ""
-	}
-	return cleanSbatchValue(matches[2])
-}
-
 func cleanSbatchValue(value string) string {
 	value = strings.TrimSpace(value)
 	value = strings.Trim(value, "\"'")
@@ -607,16 +615,65 @@ func resolveLogPath(value, baseDir, jobID, jobName string) string {
 		return ""
 	}
 
-	value = strings.ReplaceAll(value, "%j", jobID)
-	if jobName != "" {
-		value = strings.ReplaceAll(value, "%x", jobName)
+	arrayID, taskID, arrayTask := strings.Cut(jobID, "_")
+	arrayTask = arrayTask && decimalID(arrayID) && decimalID(taskID)
+	var expanded strings.Builder
+	expanded.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		if value[i] != '%' || i+1 == len(value) {
+			expanded.WriteByte(value[i])
+			continue
+		}
+		i++
+		replacement := ""
+		switch value[i] {
+		case '%':
+			replacement = "%"
+		case 'j':
+			// An array's displayed A_a ID does not encode its numeric JobID.
+			if decimalID(jobID) {
+				replacement = jobID
+			}
+		case 'A':
+			if arrayTask {
+				replacement = arrayID
+			} else if decimalID(jobID) {
+				replacement = jobID
+			}
+		case 'a':
+			if arrayTask {
+				replacement = taskID
+			}
+		case 'x':
+			replacement = jobName
+		}
+		if replacement == "" {
+			// Preserve unknown tokens rather than inventing an array task.
+			expanded.WriteByte('%')
+			expanded.WriteByte(value[i])
+		} else {
+			expanded.WriteString(replacement)
+		}
 	}
+	value = expanded.String()
 
 	if value != "" && !strings.HasPrefix(value, "/") && baseDir != "" {
 		value = fmt.Sprintf("%s/%s", baseDir, value)
 	}
 
 	return value
+}
+
+func decimalID(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := range value {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // logArchiveDir returns the root directory for the deterministic "archive convention"

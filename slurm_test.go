@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -296,5 +298,52 @@ func TestResolveArchiveConventionPathsMergedOutput(t *testing.T) {
 	}
 	if gotErr != mergedPath {
 		t.Fatalf("expected stderr to fall back to stdout %q, got %q", mergedPath, gotErr)
+	}
+}
+
+func installCommandFixture(t *testing.T, name, output string) {
+	t.Helper()
+	dir := t.TempDir()
+	quoted := "'" + strings.ReplaceAll(output, "'", "'\"'\"'") + "'"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nprintf '%s' "+quoted+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestResolveLiveLogPathsPreservesSpaces(t *testing.T) {
+	installCommandFixture(t, "scontrol", "JobId=123 WorkDir=/scratch/my project StdOut=/scratch/my project/train.out StdErr=/scratch/my project/train.err\n")
+	stdout, stderr, err := ResolveLogPathsContext(context.Background(), "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "/scratch/my project/train.out" || stderr != "/scratch/my project/train.err" {
+		t.Fatalf("log paths lost whitespace: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
+func TestResolveArrayLogPathsFromSubmitLine(t *testing.T) {
+	stdout, stderr, ok := resolveSacctLogPaths(sacctLogInfo{
+		workDir:    "/scratch/my project",
+		jobName:    "train",
+		submitLine: "sbatch --output='logs/%x-%A_%a.out' --error='logs/%A_%a.err' train.sh",
+	}, "123_4")
+	if !ok || stdout != "/scratch/my project/logs/train-123_4.out" || stderr != "/scratch/my project/logs/123_4.err" {
+		t.Fatalf("array log paths = %q, %q (resolved=%v)", stdout, stderr, ok)
+	}
+}
+
+func TestLogPatternsPreserveUnknownIDsAndLiteralPercents(t *testing.T) {
+	for _, tc := range []struct {
+		pattern, id, want string
+	}{
+		{"%%A-%A_%a.out", "123_4", "/logs/%A-123_4.out"},
+		{"%A_%a.out", "123_[1-5]", "/logs/%A_%a.out"},
+		{"%A_%a.out", "123", "/logs/123_%a.out"},
+		{"%j.out", "123_4", "/logs/%j.out"},
+	} {
+		if got := resolveLogPath(tc.pattern, "/logs", tc.id, "train"); got != tc.want {
+			t.Errorf("pattern %q for %q = %q, want %q", tc.pattern, tc.id, got, tc.want)
+		}
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +61,9 @@ const (
 	filterAll statusFilter = iota
 	filterRunning
 	filterPending
+	filterFailed
+	filterCompleted
+	filterCancelled
 )
 
 func (s statusFilter) String() string {
@@ -70,9 +72,53 @@ func (s statusFilter) String() string {
 		return "Running"
 	case filterPending:
 		return "Pending"
+	case filterFailed:
+		return "Failed"
+	case filterCompleted:
+		return "Completed"
+	case filterCancelled:
+		return "Cancelled"
 	default:
 		return "All"
 	}
+}
+
+func (s statusFilter) matches(job Job) bool {
+	switch s {
+	case filterRunning:
+		return job.IsRunning()
+	case filterPending:
+		return job.IsPending()
+	case filterFailed:
+		switch job.State() {
+		case "F", "TO", "NF", "OOM", "BF", "DL", "BOOT_FAIL", "DEADLINE":
+			return true
+		}
+		return false
+	case filterCompleted:
+		return job.State() == "CD"
+	case filterCancelled:
+		return job.State() == "CA"
+	default:
+		return true
+	}
+}
+
+func (m *Model) cycleStatusFilter() {
+	if m.appMode == modeHistory {
+		switch m.sFilter {
+		case filterAll:
+			m.sFilter = filterFailed
+		case filterFailed:
+			m.sFilter = filterCompleted
+		case filterCompleted:
+			m.sFilter = filterCancelled
+		default:
+			m.sFilter = filterAll
+		}
+		return
+	}
+	m.sFilter = (m.sFilter + 1) % 3
 }
 
 type jobTableRow struct {
@@ -274,11 +320,9 @@ type Model struct {
 	lastRefresh time.Time
 	err         error
 
-	rawDetails string // Store raw details for re-wrapping on resize
-	// Force a detail re-fetch after the next jobs refresh completes.
-	refreshSelectedDetails bool
-	inputMode              bool // if true, focus on filter input
-	mouseEnabled           bool
+	rawDetails   string // Store raw details for re-wrapping on resize
+	inputMode    bool   // if true, focus on filter input
+	mouseEnabled bool
 
 	// Saved main-view mouse setting before entering tail view. Tail view may
 	// auto-disable mouse for easier text selection/copying.
@@ -289,6 +333,7 @@ type Model struct {
 
 	jobsRequestID      int
 	detailsRequestID   int
+	detailsPending     bool
 	tailPathsRequestID int
 	jobsCancel         context.CancelFunc
 	detailsCancel      context.CancelFunc
@@ -380,34 +425,125 @@ func NewModel() Model {
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
-		m.fetchJobsCmd(context.Background()),
+		func() tea.Msg { return refreshNowMsg{} },
 		m.tickCmd(),
 		initialWindowSizeCmd(),
 	)
 }
 
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
+// Background work belongs to the model, not to whichever overlay owns input.
+func (m *Model) updateBackground(msg tea.Msg) (tea.Cmd, bool) {
 	var cmds []tea.Cmd
-	handledTick := false
-
-	if m.copyFeedback != "" && time.Now().After(m.copyFeedbackExpiry) {
-		m.copyFeedback = ""
-	}
-
-	if _, ok := msg.(tickMsg); ok {
-		handledTick = true
-		// While tailing logs we still keep the tick loop alive so the app
-		// continues to refresh normally after exiting, but we avoid polling
-		// Slurm in the background.
+	switch msg := msg.(type) {
+	case tickMsg:
 		if !m.paused && !m.inTailView {
 			cmds = append(cmds, m.queueJobsFetchCmd())
 		}
 		cmds = append(cmds, m.tickCmd())
 
-		if m.inTailView {
-			return m, tea.Batch(cmds...)
+	case tea.WindowSizeMsg:
+		width, height := msg.Width, msg.Height
+		if width <= 0 {
+			width = m.width
 		}
+		if height <= 0 {
+			height = m.height
+		}
+		m.applyWindowSize(width, height)
+		if m.inValueOverlay {
+			m.configureValueViewport()
+		}
+		if m.inTailView {
+			tail, cmd := m.tailModel.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
+			m.tailModel = tail.(TailModel)
+			cmds = append(cmds, cmd)
+		}
+
+	case jobsMsg:
+		if msg.requestID != m.jobsRequestID || msg.mode != m.appMode {
+			return nil, true
+		}
+		m.jobs = msg.jobs
+		m.lastRefresh = time.Now()
+		m.loadingJobs = false
+		m.err = nil
+		m.updateTable()
+		cmds = append(cmds, m.syncSelectedJob(true))
+
+	case jobsErrMsg:
+		if msg.requestID != m.jobsRequestID || msg.mode != m.appMode || errors.Is(msg.err, context.Canceled) {
+			return nil, true
+		}
+		m.err = msg.err
+		m.loadingJobs = false
+
+	case detailsMsg:
+		if msg.requestID != m.detailsRequestID || msg.jobID != m.selectedID || msg.history != (m.appMode == modeHistory) {
+			return nil, true
+		}
+		m.detailsPending = false
+		if m.detailsCancel != nil {
+			m.detailsCancel()
+			m.detailsCancel = nil
+		}
+		m.rawDetails = msg.text
+		m.updateDetailsTable(m.rawDetails)
+
+	case detailsDebounceMsg:
+		if msg.requestID != m.detailsRequestID || msg.jobID != m.selectedID || msg.history != (m.appMode == modeHistory) {
+			return nil, true
+		}
+		cmds = append(cmds, m.startDetailsFetchCmd(msg.jobID, msg.requestID, msg.history))
+
+	case tailPathsMsg:
+		if msg.requestID != m.tailPathsRequestID {
+			return nil, true
+		}
+		m.cancelTailPaths()
+		if msg.err != nil {
+			m.err = msg.err
+		}
+		m.mouseEnabledBeforeTail = m.mouseEnabled
+		m.tailModel = NewTailModel(msg.jobID, msg.stdout, msg.stderr, m.width, m.height, msg.mode)
+		m.tailModel.mouseEnabled = m.mouseEnabled
+		m.inTailView = true
+		cmds = append(cmds, m.tailModel.Init())
+
+	case tailStartMsg, logLineMsg, selectionAutoScrollMsg, pagerFinishedMsg:
+		// Late startup messages still own resources after leaving the log view.
+		tail, cmd := m.tailModel.Update(msg)
+		m.tailModel = tail.(TailModel)
+		cmds = append(cmds, cmd)
+
+	case errMsg:
+		m.err = msg
+
+	case refreshNowMsg:
+		cmds = append(cmds, m.queueJobsFetchCmd())
+
+	default:
+		return nil, false
+	}
+	if !m.inTailView {
+		m.applyPanelHeights()
+	}
+	return tea.Batch(cmds...), true
+}
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	var cmds []tea.Cmd
+
+	if m.copyFeedback != "" && time.Now().After(m.copyFeedbackExpiry) {
+		m.copyFeedback = ""
+	}
+
+	if cmd, handled := m.updateBackground(msg); handled {
+		return m, cmd
+	}
+
+	if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.Type == tea.KeyCtrlC {
+		return m, m.quitCmd()
 	}
 
 	if m.confirmingCancel {
@@ -429,28 +565,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if m.inValueOverlay && !handledTick {
+	if m.inValueOverlay {
 		switch msg := msg.(type) {
-		case tea.WindowSizeMsg:
-			width := msg.Width
-			height := msg.Height
-			if width <= 0 {
-				if m.width > 0 {
-					width = m.width
-				} else {
-					width, _ = detectTerminalSize()
-				}
-			}
-			if height <= 0 {
-				if m.height > 0 {
-					height = m.height
-				} else {
-					_, height = detectTerminalSize()
-				}
-			}
-			m.applyWindowSize(width, height)
-			m.configureValueViewport()
-			return m, nil
 		case tea.KeyMsg:
 			if key.Matches(msg, keys.CopyValue) {
 				if strings.TrimSpace(m.valueValue) != "" {
@@ -476,28 +592,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	}
 
-	if m.inDetailsOverlay && !handledTick {
+	if m.inDetailsOverlay {
 		switch msg := msg.(type) {
-		case tea.WindowSizeMsg:
-			// Keep overlay responsive to resizes.
-			width := msg.Width
-			height := msg.Height
-			if width <= 0 {
-				if m.width > 0 {
-					width = m.width
-				} else {
-					width, _ = detectTerminalSize()
-				}
-			}
-			if height <= 0 {
-				if m.height > 0 {
-					height = m.height
-				} else {
-					_, height = detectTerminalSize()
-				}
-			}
-			m.applyWindowSize(width, height)
-			return m, nil
 		case tea.KeyMsg:
 			if key.Matches(msg, keys.ToggleHelp) {
 				m.help.ShowAll = !m.help.ShowAll
@@ -511,10 +607,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			}
 			if key.Matches(msg, keys.ViewValue) {
-				if cmd := m.openValueOverlayCmd(); cmd != nil {
-					cmds = append(cmds, cmd)
-					return m, tea.Batch(cmds...)
-				}
+				m.openValueOverlay()
+				return m, nil
 			}
 			if key.Matches(msg, keys.ToggleDetails) {
 				m.toggleDetailsMode()
@@ -524,6 +618,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "esc", "q", "i":
 				m.inDetailsOverlay = false
+				m.table.Focus()
+				m.detailsTable.Blur()
 				// Re-apply layout so widths/heights go back to normal.
 				m.applyWindowSize(m.width, m.height)
 				return m, nil
@@ -536,7 +632,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	}
 
-	if m.inTailView && !handledTick {
+	if m.inTailView {
 		wasInSearchMode := m.tailModel.InSearchMode()
 
 		switch msg := msg.(type) {
@@ -544,25 +640,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if key.Matches(msg, tailKeys.ToggleHelp) && !wasInSearchMode {
 				m.help.ShowAll = !m.help.ShowAll
 				return m, nil
-			}
-			if key.Matches(msg, tailKeys.Quit) && !wasInSearchMode {
-				m.inTailView = false
-				// Restore the pre-tail mouse setting (tail view may have
-				// auto-disabled it).
-				if m.mouseEnabled != m.mouseEnabledBeforeTail {
-					m.mouseEnabled = m.mouseEnabledBeforeTail
-					if m.mouseEnabled {
-						cmds = append(cmds, tea.EnableMouseCellMotion)
-					} else {
-						cmds = append(cmds, tea.DisableMouse)
-					}
-				}
-				// Re-trigger a job refresh when coming back
-				cmds = append(cmds, m.queueJobsFetchCmd())
-				// Refresh details to clear "Resolving logs..." status
-				if m.selectedID != "" {
-					cmds = append(cmds, m.queueDetailsFetchCmd(m.selectedID))
-				}
 			}
 			// Capture mouse toggle from tail view to keep state in sync
 			if key.Matches(msg, tailKeys.ToggleMouse) && !wasInSearchMode {
@@ -586,7 +663,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mouseEnabled = m.tailModel.mouseEnabled
 		}
 
-		// Double check if we should exit based on the msg that was processed
 		if msg, ok := msg.(tea.KeyMsg); ok && key.Matches(msg, tailKeys.Quit) && !wasInSearchMode {
 			m.inTailView = false
 			// Restore the pre-tail mouse setting (tail view may have
@@ -599,10 +675,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, tea.DisableMouse)
 				}
 			}
-			// Refresh details here too just in case
-			if m.selectedID != "" {
-				cmds = append(cmds, m.queueDetailsFetchCmd(m.selectedID))
-			}
+			m.applyWindowSize(m.width, m.height)
+			cmds = append(cmds, m.queueJobsFetchCmd(), m.syncSelectedJob(true))
 			return m, tea.Batch(cmds...)
 		}
 
@@ -610,104 +684,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		// Some terminals briefly report zero dimensions (e.g. during font or window
-		// changes). Instead of ignoring these events entirely – which can leave the
-		// UI in an uninitialized state until the next real resize – fall back to the
-		// last known or a reasonable default size.
-		width := msg.Width
-		height := msg.Height
-		if width <= 0 {
-			if m.width > 0 {
-				width = m.width
-			} else {
-				width, _ = detectTerminalSize()
-			}
-		}
-		if height <= 0 {
-			if m.height > 0 {
-				height = m.height
-			} else {
-				_, height = detectTerminalSize()
-			}
-		}
-
-		m.applyWindowSize(width, height)
-		if m.inValueOverlay {
-			m.configureValueViewport()
-		}
-
-	case jobsMsg:
-		if msg.requestID != m.jobsRequestID || msg.mode != m.appMode {
-			break
-		}
-		m.jobs = msg.jobs
-		m.lastRefresh = time.Now()
-		m.loadingJobs = false
-		m.err = nil
-		m.updateTable()
-
-		// Sync selection immediately
-		if id := m.selectedJobID(); id != "" {
-			// If selection changed or we haven't loaded details yet (e.g. startup).
-			// When details are hidden (small window), avoid fetching details on every
-			// selection change; fetch on-demand when opening the overlay.
-			if id != m.selectedID || m.selectedID == "" || m.refreshSelectedDetails {
-				m.selectedID = id
-				m.updateTable()
-				if !m.hideDetails {
-					cmds = append(cmds, m.queueDetailsFetchCmd(id))
-				}
-			}
-		}
-		m.refreshSelectedDetails = false
-
-	case jobsErrMsg:
-		if msg.requestID != m.jobsRequestID || msg.mode != m.appMode || errors.Is(msg.err, context.Canceled) {
-			break
-		}
-		m.err = msg.err
-		m.loadingJobs = false
-
-	case detailsMsg:
-		if msg.requestID != m.detailsRequestID || msg.jobID != m.selectedID || msg.history != (m.appMode == modeHistory) {
-			break
-		}
-		m.rawDetails = msg.text
-		m.updateDetailsTable(m.rawDetails)
-
-	case detailsDebounceMsg:
-		if msg.requestID != m.detailsRequestID || msg.jobID != m.selectedID || msg.history != (m.appMode == modeHistory) {
-			break
-		}
-		cmds = append(cmds, m.startDetailsFetchCmd(msg.jobID, msg.requestID, msg.history))
-
-	case tailPathsMsg:
-		if msg.requestID != m.tailPathsRequestID {
-			break
-		}
-		// Use the job ID associated with the request; selection may have
-		// changed while paths were resolving.
-		if msg.jobID != "" {
-			m.selectedID = msg.jobID
-			m.setTableCursorByJobID(msg.jobID)
-		}
-		if msg.err != nil {
-			m.err = msg.err
-		}
-		m.mouseEnabledBeforeTail = m.mouseEnabled
-		m.tailModel = NewTailModel(m.selectedID, msg.stdout, msg.stderr, m.width, m.height, msg.mode)
-		m.tailModel.mouseEnabled = m.mouseEnabled // Sync state
-		m.inTailView = true
-		cmds = append(cmds, m.tailModel.Init())
-
-	case errMsg:
-		m.err = msg
-
-	case refreshNowMsg:
-		// Trigger a refresh without spawning another tick loop.
-		cmds = append(cmds, m.queueJobsFetchCmd())
-
 	case tea.MouseMsg:
 		if msg.Type == tea.MouseLeft {
 			if m.hideDetails {
@@ -745,6 +721,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.filterInput, cmd = m.filterInput.Update(msg)
 				cmds = append(cmds, cmd)
 				m.updateTable()
+				cmds = append(cmds, m.syncSelectedJob(false))
 				return m, tea.Batch(cmds...)
 			}
 		} else {
@@ -754,7 +731,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.applyWindowSize(m.width, m.height)
 				return m, nil
 			case key.Matches(msg, keys.Quit):
-				return m, tea.Quit
+				return m, m.quitCmd()
 			case key.Matches(msg, keys.Filter):
 				m.inputMode = true
 				m.filterInput.Focus()
@@ -763,21 +740,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case key.Matches(msg, keys.Pause):
 				m.paused = !m.paused
 			case key.Matches(msg, keys.Refresh):
-				m.refreshSelectedDetails = true
 				cmds = append(cmds, m.queueJobsFetchCmd())
 			case key.Matches(msg, keys.History):
-				m.loadingJobs = true
+				m.cancelTailPaths()
 				if m.appMode == modeLive {
 					m.appMode = modeHistory
 				} else {
 					m.appMode = modeLive
 				}
-				cmds = append(cmds, m.queueJobsFetchCmd())
-				cmds = append(cmds, func() tea.Msg {
-					return tea.WindowSizeMsg{Width: m.width, Height: m.height}
-				})
+				m.sFilter = filterAll
+				m.jobs = nil
+				m.lastRefresh = time.Time{}
+				m.updateTable()
+				cmds = append(cmds, m.syncSelectedJob(false), m.queueJobsFetchCmd())
+				m.applyWindowSize(m.width, m.height)
 			case key.Matches(msg, keys.StatusFilter):
-				m.sFilter = (m.sFilter + 1) % 3
+				m.cycleStatusFilter()
 				m.updateTable()
 			case key.Matches(msg, keys.InspectJob):
 				job := m.getSelectedJob()
@@ -785,6 +763,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// In small windows the details panel is hidden; use a full-screen overlay.
 					if m.hideDetails {
 						m.inDetailsOverlay = true
+						m.cancelTailPaths()
 						m.detailsTable.Focus()
 						m.table.Blur()
 						cmds = append(cmds, m.queueDetailsFetchCmd(job.JobID))
@@ -798,6 +777,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				job := m.getSelectedJob()
 				if job != nil {
 					m.cancelCandidate = job
+					m.cancelTailPaths()
 					m.confirmingCancel = true
 				}
 			case key.Matches(msg, keys.TailLogs):
@@ -851,10 +831,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, cmd)
 				}
 			case key.Matches(msg, keys.ViewValue):
-				if cmd := m.openValueOverlayCmd(); cmd != nil {
-					cmds = append(cmds, cmd)
-					return m, tea.Batch(cmds...)
-				}
+				m.openValueOverlay()
+				return m, nil
 			case key.Matches(msg, keys.ToggleDetails):
 				m.toggleDetailsMode()
 				return m, nil
@@ -867,13 +845,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.table, cmd = m.table.Update(msg)
 		cmds = append(cmds, cmd)
 
-		if id := m.selectedJobID(); id != "" && id != m.selectedID {
-			m.selectedID = id
-			m.updateTable()
-			if !m.hideDetails {
-				cmds = append(cmds, m.queueDetailsFetchCmd(id))
-			}
-		}
+		cmds = append(cmds, m.syncSelectedJob(false))
 	}
 
 	m.detailsTable, cmd = m.detailsTable.Update(msg)
@@ -1246,7 +1218,7 @@ func (m Model) renderDetailsPanel() string {
 	return panelStyle.Render(detailsContent)
 }
 
-func (m Model) viewDetailsOverlay() string {
+func (m Model) detailsOverlayHeader() string {
 	header := metaPillStyle.Copy().
 		Foreground(textStrong).
 		BorderForeground(panelBorder).
@@ -1259,10 +1231,13 @@ func (m Model) viewDetailsOverlay() string {
 	} else {
 		top = joinWithGap([]string{header, hint}, 1)
 	}
-	top = lipgloss.NewStyle().MaxWidth(m.width).Render(top)
+	return lipgloss.NewStyle().MaxWidth(m.width).Render(top)
+}
+
+func (m *Model) configureDetailsOverlay() {
 
 	// Allocate remaining height to the table.
-	reserved := lipgloss.Height(top) + lipgloss.Height(m.help.View(keys))
+	reserved := lipgloss.Height(m.detailsOverlayHeader()) + lipgloss.Height(m.help.View(keys))
 	bodyH := m.height - reserved
 	if bodyH < 5 {
 		bodyH = 5
@@ -1287,6 +1262,10 @@ func (m Model) viewDetailsOverlay() string {
 		{Title: "Value", Width: valW},
 	})
 	m.detailsTable.SetHeight(bodyH - 3)
+}
+
+func (m Model) viewDetailsOverlay() string {
+	top := m.detailsOverlayHeader()
 
 	panel := m.detailsBoxStyle().Width(m.width - 2).Render(m.renderDetailsTable())
 
@@ -1391,20 +1370,19 @@ func (m Model) renderDetailsTable() string {
 	return lipgloss.JoinVertical(lipgloss.Left, append([]string{header}, body...)...)
 }
 
-func (m *Model) openValueOverlayCmd() tea.Cmd {
+func (m *Model) openValueOverlay() {
 	// Ensure we have a selected detail row.
 	keyText, valueText, ok := m.selectedDetailEntry()
 	if !ok {
 		m.copyFeedback = "Select a detail row to view"
 		m.copyFeedbackExpiry = time.Now().Add(2 * time.Second)
-		return nil
+		return
 	}
 
 	m.inValueOverlay = true
 	m.valueKey = keyText
 	m.valueValue = valueText
 	m.configureValueViewport()
-	return nil
 }
 
 func (m *Model) configureValueViewport() {
@@ -1686,6 +1664,10 @@ func (m *Model) applyPanelHeights() {
 		tableContentHeight = 0
 	}
 	m.table.SetHeight(tableContentHeight)
+	if m.inDetailsOverlay {
+		m.configureDetailsOverlay()
+		return
+	}
 
 	detailsTitleHeight := lipgloss.Height(m.detailsPanelTitle())
 	_, detailsFrameHeight := m.detailsBoxStyle().GetFrameSize()
@@ -2139,8 +2121,6 @@ func curatedDetailRows(rows []table.Row) []table.Row {
 	return curated
 }
 
-var detailKeyPattern = regexp.MustCompile(`(?:^|\s)([A-Za-z][A-Za-z0-9_.:/-]*)=`)
-
 func parseDetailsToRows(text string) []table.Row {
 	// Handle potential error messages
 	if strings.HasPrefix(text, "Error") {
@@ -2155,36 +2135,15 @@ func parseDetailsToRows(text string) []table.Row {
 }
 
 func parseScontrolDetailsRows(text string) []table.Row {
-	clean := strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
-	if clean == "" {
-		return nil
-	}
-
-	matches := detailKeyPattern.FindAllStringSubmatchIndex(clean, -1)
-	if len(matches) == 0 {
-		return nil
-	}
-
-	rows := make([]table.Row, 0, len(matches))
-	for i, match := range matches {
-		if len(match) < 4 {
-			continue
-		}
-
-		key := clean[match[2]:match[3]]
-		valueStart := match[1]
-		valueEnd := len(clean)
-		if i+1 < len(matches) {
-			valueEnd = matches[i+1][0]
-		}
-
-		value := strings.TrimSpace(clean[valueStart:valueEnd])
+	fields := parseScontrolDetails(text)
+	rows := make([]table.Row, 0, len(fields))
+	for _, field := range fields {
+		value := field.value
 		if value == "" {
 			value = "(empty)"
 		}
-		rows = append(rows, table.Row{key, value})
+		rows = append(rows, table.Row{field.key, value})
 	}
-
 	return rows
 }
 
@@ -2347,11 +2306,58 @@ func (m *Model) setTableCursorByJobID(jobID string) {
 	}
 }
 
-func (m *Model) updateTable() {
-	if m.loadingJobs {
-		return
+// Keep details tied to the selected job even when filtering or refreshing
+// removes the selection. Invalidating requests also rejects queued debounces.
+func (m *Model) syncSelectedJob(refresh bool) tea.Cmd {
+	id := m.selectedJobID()
+	changed := id != m.selectedID
+	if changed {
+		if m.detailsCancel != nil {
+			m.detailsCancel()
+			m.detailsCancel = nil
+		}
+		m.detailsRequestID++
+		m.detailsPending = false
+		m.cancelTailPaths()
+		m.selectedID = id
+		m.rawDetails = ""
+		m.detailsTable.SetRows(nil)
+		m.inValueOverlay = false
+		m.valueKey = ""
+		m.valueValue = ""
+		m.copyFeedback = ""
 	}
+	if id != "" && (changed || refresh && !m.detailsPending) && !m.inTailView && (!m.hideDetails || m.inDetailsOverlay) {
+		return m.queueDetailsFetchCmd(id)
+	}
+	return nil
+}
 
+func (m *Model) cancelTailPaths() {
+	if m.tailPathsCancel != nil {
+		m.tailPathsCancel()
+		m.tailPathsCancel = nil
+	}
+	m.tailPathsRequestID++
+}
+
+func (m *Model) quitCmd() tea.Cmd {
+	if m.jobsCancel != nil {
+		m.jobsCancel()
+	}
+	if m.detailsCancel != nil {
+		m.detailsCancel()
+	}
+	m.cancelTailPaths()
+	if m.inTailView {
+		tail, cleanup := m.tailModel.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+		m.tailModel = tail.(TailModel)
+		return tea.Sequence(cleanup, tea.Quit)
+	}
+	return tea.Quit
+}
+
+func (m *Model) updateTable() {
 	m.filtered = []Job{}
 	query := strings.ToLower(m.filterInput.Value())
 
@@ -2359,10 +2365,7 @@ func (m *Model) updateTable() {
 		if m.appMode == modeHistory && !j.IsHistorical() {
 			continue
 		}
-		if m.sFilter == filterRunning && !j.IsRunning() {
-			continue
-		}
-		if m.sFilter == filterPending && !j.IsPending() {
+		if !m.sFilter.matches(j) {
 			continue
 		}
 
@@ -2384,6 +2387,7 @@ func (m *Model) updateTable() {
 		rows = append(rows, newJobTableRow(j).tableRow(currentCols))
 	}
 	m.table.SetRows(rows)
+	m.setTableCursorByJobID(m.selectedID)
 }
 
 // --- Commands ---
@@ -2488,6 +2492,7 @@ func (m *Model) queueJobsFetchCmd() tea.Cmd {
 		m.jobsCancel()
 	}
 	m.jobsRequestID++
+	m.loadingJobs = true
 	ctx, cancel := context.WithCancel(context.Background())
 	m.jobsCancel = cancel
 	return m.fetchJobsCmd(ctx)
@@ -2499,6 +2504,7 @@ func (m *Model) queueDetailsFetchCmd(id string) tea.Cmd {
 		m.detailsCancel = nil
 	}
 	m.detailsRequestID++
+	m.detailsPending = true
 	requestID := m.detailsRequestID
 	history := m.appMode == modeHistory
 	if m.detailsDebounce <= 0 {

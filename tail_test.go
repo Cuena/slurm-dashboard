@@ -1,10 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -542,5 +549,126 @@ func TestTailShowStdoutStartsMissingPaneFromStderrMode(t *testing.T) {
 	}
 	if start.pane != "stdout" {
 		t.Fatalf("expected missing stdout pane to start, got %q", start.pane)
+	}
+}
+
+func TestTailSearchConsumesStartupAndKeepsReading(t *testing.T) {
+	m := NewTailModel("101", "", "", 80, 24, TailModeStdout)
+	m.inSearchMode = true
+	start := tailStartMsg{
+		session: m.session,
+		pane:    "stdout",
+		reader:  bufio.NewReader(strings.NewReader("first output\nsecond output\n")),
+	}
+	model, cmd := m.Update(start)
+	m = model.(TailModel)
+	reachedEOF := false
+	for range 3 {
+		messages := runTeaCmd(cmd)
+		if len(messages) == 0 {
+			break
+		}
+		for _, msg := range messages {
+			if line, ok := msg.(logLineMsg); ok && line.terminal {
+				reachedEOF = true
+			}
+			model, cmd = m.Update(msg)
+			m = model.(TailModel)
+		}
+	}
+	if !reachedEOF || !m.inSearchMode || !strings.Contains(strings.Join(m.stdoutLines, "\n"), "first output\nsecond output") {
+		t.Fatalf("search interrupted log consumption: EOF=%v lines=%q", reachedEOF, m.stdoutLines)
+	}
+}
+
+func TestTailExitCancelsQueuedStartup(t *testing.T) {
+	m := NewTailModel("101", "/unused/log", "", 80, 24, TailModeStdout)
+	start := m.startTailCmd("stdout", m.stdoutPath)
+	_, cleanup := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	runTeaCmd(cleanup)
+	msg := start().(tailStartMsg)
+	if !errors.Is(msg.startErr, context.Canceled) || msg.cmd != nil {
+		runTeaCmd(cleanupProcessCmd(msg.cmd, msg.pipe))
+		t.Fatalf("queued startup ran after exit: %v", msg.startErr)
+	}
+}
+
+func TestTailLateStartupReapsProcessAndClosesPipe(t *testing.T) {
+	if _, err := exec.LookPath("tail"); err != nil {
+		t.Skip("tail unavailable")
+	}
+	path := filepath.Join(t.TempDir(), "log")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewTailModel("101", path, "", 80, 24, TailModeStdout)
+	start := m.startTailCmd("stdout", path)().(tailStartMsg)
+	if start.startErr != nil {
+		t.Fatal(start.startErr)
+	}
+	cleanup := cleanupProcessCmd(start.cmd, start.pipe)
+	t.Cleanup(func() {
+		m.cancelSession()
+		if start.cmd.ProcessState == nil {
+			runTeaCmd(cleanup)
+		}
+	})
+	model, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = model.(TailModel)
+	_, staleCleanup := m.Update(start)
+	runTeaCmd(staleCleanup)
+	if start.cmd.ProcessState == nil {
+		t.Fatal("stale tail process was not waited for")
+	}
+	if _, err := start.pipe.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("stale pipe remains open: %v", err)
+	}
+}
+
+func TestTailStreamsHistoryAndWritesDuringSearch(t *testing.T) {
+	if _, err := exec.LookPath("tail"); err != nil {
+		t.Skip("tail unavailable")
+	}
+	path := filepath.Join(t.TempDir(), "log")
+	if err := os.WriteFile(path, []byte("history line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewTailModel("101", path, "", 80, 24, TailModeStdout)
+	start := m.startTailCmd("stdout", path)().(tailStartMsg)
+	if start.startErr != nil {
+		t.Fatal(start.startErr)
+	}
+	cleanup := cleanupProcessCmd(start.cmd, start.pipe)
+	t.Cleanup(func() { m.cancelSession(); runTeaCmd(cleanup) })
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = file.WriteString("appended line\n")
+	file.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.inSearchMode = true
+	model, cmd := m.Update(start)
+	m = model.(TailModel)
+	for !strings.Contains(strings.Join(m.stdoutLines, "\n"), "appended line") {
+		results := make(chan []tea.Msg, 1)
+		go func(read tea.Cmd) { results <- runTeaCmd(read) }(cmd)
+		select {
+		case messages := <-results:
+			if len(messages) == 0 {
+				t.Fatal("log read chain stopped during search")
+			}
+			for _, msg := range messages {
+				model, cmd = m.Update(msg)
+				m = model.(TailModel)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("tail did not deliver appended output")
+		}
+	}
+	if got := strings.Join(m.stdoutLines, "\n"); got != "history line\nappended line" {
+		t.Fatalf("log history or appended content was lost or repeated: %q", got)
 	}
 }

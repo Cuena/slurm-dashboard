@@ -8,7 +8,7 @@ Tested on MareNostrum 5.
 
 - Live jobs view from `squeue` (auto refresh every 20 seconds, configurable)
 - History mode from `sacct` (default: last 3 days, configurable)
-- Fast filtering by text and status (`All`, `Running`, `Pending`)
+- Text filtering and mode-specific state filters: live (`All`, `Running`, `Pending`) and history (`All`, `Failed`, `Completed`, `Cancelled`)
 - Job inspection panel (`scontrol` in live mode, `sacct` in history mode)
 - Job cancel with confirmation (`scancel`)
 - Log tail view for both streams or single stream (`stdout` / `stderr`)
@@ -56,10 +56,10 @@ Or:
 
 ## Main View Controls
 
-- `q`: quit
+- `q`: quit from the main view; `Ctrl+c`: quit from any view
 - `/` or `f`: filter jobs
 - `h`: toggle live/history mode
-- `g`: cycle status filter
+- `g`: cycle the current mode's status filters (switching live/history resets to `All`)
 - `r`: refresh now
 - `i` or `Enter`: inspect selected job
 - `c`: cancel selected job
@@ -72,6 +72,10 @@ Or:
 - `a`: toggle curated/all Slurm detail fields
 - `m`: toggle mouse
 - `?`: expanded help
+
+Refresh preserves the selected job when rows move. Details clear when the
+selection changes or disappears, and continue loading while the inspection
+overlay is open. Automatic refresh continues through confirmation dialogs.
 
 ## Log View Controls
 
@@ -87,16 +91,20 @@ Or:
 - `y`: native terminal copy mode
 - `Ctrl+y`: copy selection
 - `Y`: copy full active pane
-- `v`: open active log in pager (`$PAGER` or `vim -R`)
+- `v`: open the active log in `$PAGER`, or `less -R +G` when available, otherwise `vim -R`
 - `m`: toggle mouse
 - `?`: expanded help
 
+Logs continue streaming while search input is open. Leaving the log view or
+quitting cancels pending startup and closes its tail processes.
+
 Copy uses OSC52, so clipboard support depends on your terminal/tmux setup.
 
-In copy mode, drag to select. Keeping the pointer just above or below the log
-pane scrolls while extending the selection. Press `Ctrl+y` to copy and `y` to
-leave copy mode. Copies larger than 100 KiB are explicitly reported as
-truncated because many terminals impose OSC52 limits.
+`y` enables native terminal selection: use your terminal's normal selection
+and copy shortcuts, then press `y` to leave. Outside native copy mode, enable
+mouse input with `m` to drag an application-managed selection; dragging beyond
+the pane scrolls while extending it. `Ctrl+y` copies that selection through
+OSC52. Copies larger than 100 KiB are explicitly reported as truncated.
 
 ## Environment Variables
 
@@ -125,17 +133,26 @@ Compatibility names are also checked:
 - `$SLURM_DASHBOARD_LOG_ARCHIVE_DIR/slurm-<jobid>.out`
 - `$SLURM_DASHBOARD_LOG_ARCHIVE_DIR/slurm-<jobid>.err`
 
+Live log paths preserve spaces. Submission-pattern recovery supports `%A` and
+`%a` for concrete array task IDs such as `123_4`. It does not guess a task index
+for array ranges or the numeric `%j` ID of an array task; those require Slurm
+metadata or an archive entry for the concrete task.
+
 Recommended `sbatch` directives:
 
 ```bash
 # Private (default slurm-dashboard location):
-#SBATCH --output=$HOME/.slurm-dashboard/logs/%j.out
-#SBATCH --error=$HOME/.slurm-dashboard/logs/%j.err
+#SBATCH --output=/absolute/path/to/home/.slurm-dashboard/logs/%j.out
+#SBATCH --error=/absolute/path/to/home/.slurm-dashboard/logs/%j.err
 #
 # Shared (optional):
 #SBATCH --output=/absolute/shared/path/slurm-dashboard/logs/%j.out
 #SBATCH --error=/absolute/shared/path/slurm-dashboard/logs/%j.err
 ```
+
+Use literal absolute paths in `#SBATCH` directives; shell variables such as
+`$HOME` are not expanded there. Command-line arguments to `sbatch`, as shown
+below for arrays, can use shell expansion.
 
 One-time setup:
 

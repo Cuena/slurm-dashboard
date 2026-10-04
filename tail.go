@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -126,15 +128,18 @@ type selectionAutoScrollMsg struct {
 }
 
 type pagerFinishedMsg struct {
-	err error
+	session uint64
+	err     error
 }
 
 // TailModel handles the dual-pane log viewing
 type TailModel struct {
-	session    uint64
-	jobID      string
-	stdoutPath string
-	stderrPath string
+	session       uint64
+	sessionCtx    context.Context
+	cancelSession context.CancelFunc
+	jobID         string
+	stdoutPath    string
+	stderrPath    string
 
 	mode TailMode
 
@@ -290,8 +295,11 @@ var tailSelectionStyle = lipgloss.NewStyle().
 	Background(selectionBg)
 
 func NewTailModel(jobID, stdoutPath, stderrPath string, width, height int, mode TailMode) TailModel {
+	ctx, cancel := context.WithCancel(context.Background())
 	m := TailModel{
 		session:           nextTailSessionID(),
+		sessionCtx:        ctx,
+		cancelSession:     cancel,
 		jobID:             jobID,
 		stdoutPath:        stdoutPath,
 		stderrPath:        stderrPath,
@@ -1309,6 +1317,7 @@ func (m *TailModel) exitCopyMode() tea.Cmd {
 }
 
 func (m *TailModel) openInPagerCmd(path string) tea.Cmd {
+	session := m.session
 	if path == "" {
 		return nil
 	}
@@ -1338,14 +1347,35 @@ func (m *TailModel) openInPagerCmd(path string) tea.Cmd {
 	}
 
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
-		return pagerFinishedMsg{err: err}
+		return pagerFinishedMsg{session: session, err: err}
 	})
+}
+
+func (m *TailModel) stopSession() tea.Cmd {
+	if m.cancelSession != nil {
+		m.cancelSession()
+	}
+	m.session = nextTailSessionID()
+	m.selectionAutoScrollPending = false
+	cleanup := tea.Batch(
+		cleanupProcessCmd(m.stdoutCmd, m.stdoutPipe),
+		cleanupProcessCmd(m.stderrCmd, m.stderrPipe),
+	)
+	m.stdoutCmd, m.stderrCmd = nil, nil
+	m.stdoutReader, m.stderrReader = nil, nil
+	m.stdoutPipe, m.stderrPipe = nil, nil
+	return cleanup
 }
 
 func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
+	if msg, ok := msg.(tea.KeyMsg); ok && msg.Type == tea.KeyCtrlC {
+		cleanup := m.stopSession()
+		return m, cleanup
+	}
 
+	// Search owns input, not the stream lifecycle or layout events.
 	if m.inSearchMode {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -1365,11 +1395,12 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.recalculateLayout()
 				return m, nil
 			}
+			m.searchInput, cmd = m.searchInput.Update(msg)
+			m.refreshViewportContent()
+			return m, cmd
+		case tea.MouseMsg:
+			return m, nil
 		}
-		m.searchInput, cmd = m.searchInput.Update(msg)
-		cmds = append(cmds, cmd)
-		m.refreshViewportContent()
-		return m, tea.Batch(cmds...)
 	}
 
 	switch msg := msg.(type) {
@@ -1403,24 +1434,8 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, tailKeys.Quit):
-			// Cleanup tail subprocesses and close pipes. Return no message; parent
-			// handles switching back to the main view.
-			stdoutCmd := m.stdoutCmd
-			stderrCmd := m.stderrCmd
-			stdoutPipe := m.stdoutPipe
-			stderrPipe := m.stderrPipe
-
-			m.stdoutCmd = nil
-			m.stderrCmd = nil
-			m.stdoutReader = nil
-			m.stderrReader = nil
-			m.stdoutPipe = nil
-			m.stderrPipe = nil
-
-			return m, tea.Batch(
-				cleanupProcessCmd(stdoutCmd, stdoutPipe),
-				cleanupProcessCmd(stderrCmd, stderrPipe),
-			)
+			cleanup := m.stopSession()
+			return m, cleanup
 		case key.Matches(msg, tailKeys.Pause):
 			m.paused = !m.paused
 		case key.Matches(msg, tailKeys.Follow):
@@ -1760,6 +1775,9 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = m.maybeQueueSelectionAutoScroll(cmds)
 
 	case pagerFinishedMsg:
+		if msg.session != m.session {
+			break
+		}
 		if msg.err != nil {
 			m.copyFeedback = fmt.Sprintf("pager error: %v", msg.err)
 		} else {
@@ -1768,7 +1786,7 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tailStartMsg:
 		if msg.session != m.session {
-			break
+			return m, cleanupProcessCmd(msg.cmd, msg.pipe)
 		}
 		// Set initial content in one shot to avoid visible "scrolling down" when
 		// loading a lot of historical lines.
@@ -1865,6 +1883,12 @@ func (m TailModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.stderrPipe = nil
 				cmds = append(cmds, cleanupProcessCmd(stderrCmd, stderrPipe))
 			}
+		}
+	default:
+		if m.inSearchMode {
+			// Text input also needs its cursor and paste messages.
+			m.searchInput, cmd = m.searchInput.Update(msg)
+			cmds = append(cmds, cmd)
 		}
 	}
 
@@ -2182,7 +2206,11 @@ func (m TailModel) renderSearchOverlay(content string) string {
 // Commands
 
 func (m *TailModel) startTailCmd(pane, path string) tea.Cmd {
+	session, ctx, limit := m.session, m.sessionCtx, m.maxLogLines
 	return func() tea.Msg {
+		if ctx != nil && ctx.Err() != nil {
+			return tailStartMsg{session: session, pane: pane, startErr: ctx.Err()}
+		}
 		if path == "" {
 			archiveDir := logArchiveDir()
 			archiveHint := "  • No archived log found in the convention directory"
@@ -2190,7 +2218,7 @@ func (m *TailModel) startTailCmd(pane, path string) tea.Cmd {
 				archiveHint = fmt.Sprintf("  • No archived log found in %s", archiveDir)
 			}
 			return tailStartMsg{
-				session: m.session,
+				session: session,
 				pane:    pane,
 				initialLines: []string{
 					"⚠ No log path available",
@@ -2210,42 +2238,23 @@ func (m *TailModel) startTailCmd(pane, path string) tea.Cmd {
 			}
 		}
 
-		// Two-phase startup:
-		//  1) Load initial history with `tail -n <N>` in one shot.
-		//  2) Start follow with `tail -n 0 -F` so we don't replay history line-by-line.
-		//
-		// This avoids the UI visibly "scrolling down" when opening very long logs.
+		// One process owns both the history snapshot and the follow offset.
+		// Separate snapshot/follow invocations lose writes between their opens.
+		// Stream the bounded history through the same batches as live output,
+		// retaining tail -F's missing-file retries and rotation handling.
 		linesArg := "+1"
-		if m.maxLogLines > 0 {
-			linesArg = strconv.Itoa(m.maxLogLines)
+		if limit > 0 {
+			linesArg = strconv.Itoa(limit)
 		}
-
-		var initialLines []string
-		if out, err := exec.Command("tail", "-n", linesArg, path).CombinedOutput(); err == nil {
-			initialLines = splitTailOutput(out)
-			if len(initialLines) == 0 {
-				initialLines = []string{"(file exists but is empty)"}
-			}
-		} else {
-			// File might not exist yet (job pending/starting) or be inaccessible
-			initialLines = splitTailOutput(out)
-			if len(initialLines) == 0 {
-				initialLines = []string{
-					fmt.Sprintf("⚠ Cannot read: %s", path),
-					"",
-					fmt.Sprintf("Error: %v", err),
-					"",
-					"Waiting for file to appear (tail -F)...",
-				}
-			}
+		if ctx == nil {
+			ctx = context.Background()
 		}
-
-		cmd := exec.Command("tail", "-n", "0", "-F", path)
+		cmd := exec.CommandContext(ctx, "tail", "-n", linesArg, "-F", "--", path)
 
 		// Create a pipe to capture both stdout and stderr
 		r, w, err := os.Pipe()
 		if err != nil {
-			return tailStartMsg{session: m.session, pane: pane, initialLines: initialLines, startErr: fmt.Errorf("creating pipe: %w", err)}
+			return tailStartMsg{session: session, pane: pane, initialLines: []string{fmt.Sprintf("Error creating tail pipe: %v", err)}, startErr: err}
 		}
 
 		cmd.Stdout = w
@@ -2254,38 +2263,21 @@ func (m *TailModel) startTailCmd(pane, path string) tea.Cmd {
 		if err := cmd.Start(); err != nil {
 			w.Close()
 			r.Close()
-			return tailStartMsg{session: m.session, pane: pane, initialLines: initialLines, startErr: err}
+			return tailStartMsg{session: session, pane: pane, initialLines: []string{fmt.Sprintf("Error starting tail: %v", err)}, startErr: err}
 		}
 
 		// Close write end in parent so that when child closes it (on exit), scanner sees EOF
 		w.Close()
 
-		reader := bufio.NewReader(r)
-		// We need to pass this reader back to the model to loop on it
-
-		// Also, we need to keep the process reference somewhere if we want to kill it.
-		// Ideally, we wrap this in a struct that we pass back.
-
-		return tailStartMsg{session: m.session, pane: pane, initialLines: initialLines, reader: reader, cmd: cmd, pipe: r}
+		return tailStartMsg{session: session, pane: pane, reader: bufio.NewReaderSize(r, 64*1024), cmd: cmd, pipe: r}
 	}
-}
-
-func splitTailOutput(out []byte) []string {
-	s := strings.TrimRight(string(out), "\r\n")
-	if s == "" {
-		return nil
-	}
-	lines := strings.Split(s, "\n")
-	for i := range lines {
-		lines[i] = strings.TrimRight(lines[i], "\r")
-	}
-	return lines
 }
 
 func (m *TailModel) waitForLine(pane string, reader *bufio.Reader) tea.Cmd {
+	session := m.session
 	return func() tea.Msg {
 		if reader == nil {
-			return logLineMsg{session: m.session, pane: pane, err: fmt.Errorf("log reader not initialized"), terminal: true}
+			return logLineMsg{session: session, pane: pane, err: fmt.Errorf("log reader not initialized"), terminal: true}
 		}
 
 		line, err := reader.ReadString('\n')
@@ -2293,7 +2285,7 @@ func (m *TailModel) waitForLine(pane string, reader *bufio.Reader) tea.Cmd {
 		if err == nil || line != "" {
 			lines = append(lines, strings.TrimRight(line, "\r\n"))
 		}
-		if err == nil {
+		if err == nil && reader.Buffered() == 0 {
 			time.Sleep(logReadBatchInterval)
 		}
 
@@ -2311,7 +2303,7 @@ func (m *TailModel) waitForLine(pane string, reader *bufio.Reader) tea.Cmd {
 			}
 		}
 
-		return logLineMsg{session: m.session, pane: pane, lines: lines, err: err, terminal: err != nil}
+		return logLineMsg{session: session, pane: pane, lines: lines, err: err, terminal: err != nil}
 	}
 }
 
@@ -2332,14 +2324,20 @@ func osc52CopyCmd(text string) tea.Cmd {
 }
 
 func cleanupProcessCmd(cmd *exec.Cmd, pipe *os.File) tea.Cmd {
+	if cmd == nil && pipe == nil {
+		return nil
+	}
+	var once sync.Once
 	return func() tea.Msg {
-		if cmd != nil && cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		}
-		if pipe != nil {
-			_ = pipe.Close()
-		}
+		once.Do(func() {
+			if pipe != nil {
+				_ = pipe.Close()
+			}
+			if cmd != nil && cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+		})
 		return nil
 	}
 }
